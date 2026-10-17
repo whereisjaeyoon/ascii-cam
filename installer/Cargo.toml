@@ -1,0 +1,8 @@
+[package]
+name = "ascii-cam-setup"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "=0.52.0"
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem"] }
