@@ -28,18 +28,11 @@ HRESULT MediaSource::Initialize(IMFAttributes* attributes)
 	RETURN_IF_FAILED(collection->AddProfile(profile.get()));
 	RETURN_IF_FAILED(SetUnknown(MF_DEVICEMFT_SENSORPROFILE_COLLECTION, collection.get()));
 
-	try
-	{
-		auto appInfo = winrt::Windows::ApplicationModel::AppInfo::Current();
-		if (appInfo)
-		{
-			RETURN_IF_FAILED(SetString(MF_VIRTUALCAMERA_CONFIGURATION_APP_PACKAGE_FAMILY_NAME, appInfo.PackageFamilyName().data()));
-		}
-	}
-	catch (...)
-	{
-		WINTRACE(L"MediaSource::Initialize no AppX");
-	}
+	// Attempting to use C++/WinRT here introduced a dependency on the
+	// C++/WinRT runtime library (WINRT_IMPL_* symbols) which caused
+	// linker errors when building as a plain Win32 component. The
+	// package family name is optional for non-AppX scenarios, so skip
+	// retrieving it via C++/WinRT to avoid pulling that dependency.
 
 	auto streams = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFStreamDescriptor>>(_streams.size());
 	for (uint32_t i = 0; i < streams.size(); i++)

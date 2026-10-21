@@ -15,9 +15,6 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="AsciiEngine.h">
-      <Filter>Header Files</Filter>
-    </ClInclude>
     <ClInclude Include="FrameEngine.h">
       <Filter>Header Files</Filter>
     </ClInclude>

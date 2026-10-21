@@ -1,5 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod shared_memory;
+
+use std::time::Duration;
+
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, RichText, Sense, Stroke, StrokeKind,
 };
@@ -35,6 +39,16 @@ impl Filter {
         }
     }
 
+    /// FilterOption value published through shared memory. Must match the C++ `FilterOption`:
+    /// `0 = Passthrough, 1 = ASCII, 2 = Edge, 3 = Grayscale`.
+    fn wire_value(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Ascii => 1,
+            Self::Grayscale => 3,
+        }
+    }
+
     fn description(self) -> &'static str {
         match self {
             Self::None => "Natural colors. No filter.",
@@ -44,16 +58,24 @@ impl Filter {
     }
 }
 
-// Power and filters remain UI-only. Device discovery never starts capture.
-#[derive(Default)]
+// Camera ON/OFF is still preview only. The selected filter is published through shared memory.
 struct CameraApp {
     enabled: bool,
     filter: Filter,
-    devices: Vec<CameraDevice>,
-    selected_device: Option<String>,
-    device_scan: Option<Receiver<Result<Vec<CameraDevice>, String>>>,
-    device_error: Option<String>,
+    /// Last filter the consumer accepted (the publish succeeded).
+    published: Option<Filter>,
+    /// Filter whose publish failed with a non-retryable error; not retried until the user picks
+    /// another filter.
+    failed: Option<Filter>,
+    publisher: shared_memory::FilterPublisher,
+    /// Latest publish problem to show in the UI. `true` = still retrying, `false` = gave up.
+    status: Option<(bool, String)>,
 }
+
+/// How long one publish attempt waits for the consumer to acknowledge the previous value.
+/// Kept short so the UI thread never stalls; unacknowledged requests are retried later.
+const PUBLISH_TIMEOUT_MS: u32 = 50;
+const RETRY_INTERVAL: Duration = Duration::from_millis(200);
 
 impl CameraApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -73,130 +95,37 @@ impl CameraApp {
             .text_styles
             .insert(egui::TextStyle::Button, FontId::proportional(14.0));
         cc.egui_ctx.set_style(style);
-        let mut app = Self::default();
-        app.refresh_devices(&cc.egui_ctx);
-        app
-    }
 
-    fn refresh_devices(&mut self, ctx: &egui::Context) {
-        if self.device_scan.is_some() {
-            return;
-        }
-        let (sender, receiver) = mpsc::channel();
-        let ctx = ctx.clone();
-        self.device_error = None;
-        self.devices.clear();
-        match std::thread::Builder::new()
-            .name("camera-discovery".into())
-            .spawn(move || {
-                let _ = sender.send(devices::enumerate());
-                ctx.request_repaint();
-            }) {
-            Ok(_) => self.device_scan = Some(receiver),
-            Err(error) => self.device_error = Some(format!("Could not refresh cameras: {error}")),
+        Self {
+            enabled: false,
+            filter: Filter::default(),
+            published: None,
+            failed: None,
+            publisher: shared_memory::FilterPublisher::new(),
+            status: None,
         }
     }
 
-    fn poll_devices(&mut self, ctx: &egui::Context) {
-        let Some(scan) = &self.device_scan else {
-            return;
-        };
-        let result = match scan.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Empty) => {
-                ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                return;
+    /// Tries to hand the selected filter to the camera. A busy or not-yet-running consumer is
+    /// retried by `update`; any other error is shown and not retried.
+    fn publish_filter(&mut self, ctx: &egui::Context) {
+        match self
+            .publisher
+            .publish(self.filter.wire_value(), PUBLISH_TIMEOUT_MS)
+        {
+            Ok(()) => {
+                self.published = Some(self.filter);
+                self.status = None;
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err("Camera discovery stopped. Try Refresh.".into())
+            Err(e) if e.is_retryable() => {
+                self.status = Some((true, e.to_string()));
+                ctx.request_repaint_after(RETRY_INTERVAL);
             }
-        };
-        self.device_scan = None;
-        match result {
-            Ok(devices) => {
-                // Use the symbolic link, not the display name: two cameras can
-                // have identical names. Preserve selection only while present.
-                if !devices
-                    .iter()
-                    .any(|device| Some(&device.id) == self.selected_device.as_ref())
-                {
-                    self.selected_device = None;
-                }
-                self.devices = devices;
-            }
-            Err(error) => {
-                self.selected_device = None;
-                self.device_error = Some(error);
+            Err(e) => {
+                self.failed = Some(self.filter);
+                self.status = Some((false, e.to_string()));
             }
         }
-    }
-
-    fn device_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Connected devices").size(18.0).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(self.device_scan.is_none(), egui::Button::new("Refresh"))
-                    .clicked()
-                {
-                    self.refresh_devices(ui.ctx());
-                }
-            });
-        });
-        ui.label(
-            RichText::new("Physical cameras only. Select a device below.")
-                .size(12.0)
-                .color(MUTED),
-        );
-        ui.add_space(4.0);
-        egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(Stroke::new(1.0_f32, LINE))
-            .corner_radius(10.0)
-            .inner_margin(14.0)
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                if self.device_scan.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Looking for cameras...");
-                    });
-                } else if let Some(error) = &self.device_error {
-                    ui.colored_label(RED, error);
-                } else if self.devices.is_empty() {
-                    ui.label("No physical cameras found.");
-                    ui.label(
-                        RichText::new("Connect a camera, then choose Refresh.")
-                            .size(12.0)
-                            .color(MUTED),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new(format!("{} camera(s) found", self.devices.len()))
-                            .size(11.0)
-                            .color(MUTED),
-                    );
-                    egui::ScrollArea::vertical()
-                        .id_salt("device-list")
-                        .max_height(145.0)
-                        .show(ui, |ui| {
-                            for device in &self.devices {
-                                ui.push_id(&device.id, |ui| {
-                                    let selected =
-                                        self.selected_device.as_ref() == Some(&device.id);
-                                    if ui.selectable_label(selected, &device.name).clicked() {
-                                        self.selected_device = Some(device.id.clone());
-                                    }
-                                });
-                            }
-                        });
-                }
-            });
-        ui.label(
-            RichText::new("Device selection only. Video capture is not started.")
-                .size(11.0)
-                .color(MUTED),
-        );
     }
 
     fn power_switch(&mut self, ui: &mut egui::Ui) {
@@ -334,7 +263,9 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_devices(ctx);
+        if self.published != Some(self.filter) && self.failed != Some(self.filter) {
+            self.publish_filter(ctx);
+        }
         egui::TopBottomPanel::top("accent")
             .exact_height(5.0)
             .frame(egui::Frame::new().fill(RED))
@@ -416,10 +347,26 @@ impl eframe::App for CameraApp {
                         ui.label(RichText::new(self.filter.label()).size(12.0).strong());
                     });
                     ui.label(
-                        RichText::new("Power and filters are UI-only. No video capture.")
+                        RichText::new("Camera ON/OFF is preview only.")
                             .size(11.0)
                             .color(MUTED),
                     );
+                    match &self.status {
+                        Some((retrying, message)) => ui.label(
+                            RichText::new(message)
+                                .size(11.0)
+                                .color(if *retrying { MUTED } else { RED }),
+                        ),
+                        None => ui.label(
+                            RichText::new(match self.published {
+                                Some(filter) => format!("Sent: {}", filter.label()),
+                                None => "Not published yet".to_owned(),
+                            })
+                            .monospace()
+                            .size(11.0)
+                            .color(MUTED),
+                        ),
+                    };
                 });
             });
     }

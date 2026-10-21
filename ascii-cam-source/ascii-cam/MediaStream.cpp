@@ -50,85 +50,50 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 
 HRESULT MediaStream::Start(IMFMediaType* requestedType)
 {
-    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
-    {
-        winrt::slim_lock_guard lock(_lock);
-        RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_queue || !_allocator);
-        if (_state == MF_STREAM_STATE_RUNNING) return _streamError;
-        if (_state == MF_STREAM_STATE_PAUSED)
-        {
-            _state = MF_STREAM_STATE_RUNNING;
-            return _queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
-        }
-    }
-    // Also support SetStreamState(RUNNING), which has no media-type argument.
-    wil::com_ptr_nothrow<IMFMediaType> type;
-    if (requestedType)
-        RETURN_IF_FAILED(requestedType->QueryInterface(IID_PPV_ARGS(&type)));
-    else
-    {
-        wil::com_ptr_nothrow<IMFMediaTypeHandler> handler;
-        RETURN_IF_FAILED(_descriptor->GetMediaTypeHandler(&handler));
-        RETURN_IF_FAILED(handler->GetCurrentMediaType(&type));
-    }
-    GUID format = GUID_NULL;
-    UINT32 width = 0, height = 0, num = 0, den = 0;
-    RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &format));
-    RETURN_IF_FAILED(MFGetAttributeSize(type.get(), MF_MT_FRAME_SIZE, &width, &height));
-    RETURN_IF_FAILED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &num, &den));
-    RETURN_HR_IF(MF_E_INVALIDMEDIATYPE, format != MFVideoFormat_NV12 ||
-        width != NUM_IMAGE_COLS || height != NUM_IMAGE_ROWS || num != 30 || den != 1);
+	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator);
+	UINT32 width = 1280, height = 720;
+	UINT32 fpsNumerator = 30, fpsDenominator = 1;
+	if (type)
+	{
+		RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &_format));
+		MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
+		MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fpsNumerator, &fpsDenominator);
+		WINTRACE(L"MediaStream::Start - Format: %s, Resolution: %dx%d, FPS: %d",
+			GUID_ToStringW(_format).c_str(), width, height,
+			(fpsDenominator > 0 ? fpsNumerator / fpsDenominator : 30));
+	}
+	UINT32 framerate = (fpsDenominator > 0) ? (fpsNumerator / fpsDenominator) : 30;
+	RETURN_IF_FAILED(_capture.Initialize(width, height, framerate));
 
-    const HRESULT hr = [&]() -> HRESULT
-    {
-        RETURN_IF_FAILED(_capture.Initialize(width, height, num / den));
-        wil::com_ptr_nothrow<IMFMediaType> captureType;
-        RETURN_IF_FAILED(_capture.GetOutputType(&captureType));
-        // Grayscale now uses a D3D11 compute shader, not a CPU pixel loop.
-        RETURN_IF_FAILED(_postProcessor.Initialize(width, height, FilterOption::Grayscale, captureType.get()));
-        RETURN_IF_FAILED(_allocator->InitializeSampleAllocator(10, type.get()));
-        _allocatorInitialized = true;
-        UINT32 captureNum = num, captureDen = den;
-        (void)MFGetAttributeRatio(captureType.get(), MF_MT_FRAME_RATE, &captureNum, &captureDen);
-        UINT64 duration = 0;
-        RETURN_IF_FAILED(MFFrameRateToAverageTimePerFrame(captureNum, captureDen, &duration));
-        {
-            winrt::slim_lock_guard lock(_lock);
-            _width = width;
-            _height = height;
-            _format = format;
-            _duration = static_cast<LONGLONG>(duration);
-            _baseTime = MFGetSystemTime();
-            _firstCaptureTime.reset();
-            _lastDeliveredTime.reset();
-            _latestFrame.reset();
-            _requests.clear();
-            _streamError = S_OK;
-            _state = MF_STREAM_STATE_RUNNING;
-            RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr));
-        }
-        try
-        {
-            _captureThread = std::jthread([this](std::stop_token token) { CaptureLoop(token); });
-        }
-        catch (const std::system_error&) { return E_FAIL; }
-        catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
-        WinTraceFormat(4, 0, L"[AsciiCam] Stream started: NV12 %ux%u; GPU grayscale.", width, height);
-        return S_OK;
-    }();
-    if (FAILED(hr))
-    {
-        {
-            winrt::slim_lock_guard lock(_lock);
-            _state = MF_STREAM_STATE_STOPPED;
-            _streamError = hr;
-            (void)_queue->QueueEventParamVar(MEError, GUID_NULL, hr, nullptr);
-        }
-        StopCapture();
-        WinTraceFormat(4, 0, L"[AsciiCam] Stream initialization failed: 0x%08X", hr);
-    }
-    return hr;
-}
+	RETURN_IF_FAILED(_postProcessor.Initialize(width, height, FilterOption::Grayscale));
+
+	RETURN_IF_FAILED(
+		_allocator->InitializeSampleAllocator(
+			10,
+			type
+		)
+	);
+
+	_state = MF_STREAM_STATE_RUNNING;
+	HRESULT hr = _queue->QueueEventParamVar(
+		MEStreamStarted,
+		GUID_NULL,
+		S_OK,
+		nullptr
+	);
+	if (FAILED(hr))
+	{
+		// 이벤트 발송 실패 시 롤백 처리
+		_state = MF_STREAM_STATE_STOPPED;
+		_postProcessor.Shutdown();
+		_capture.Shutdown();
+		return hr;
+	}
+	_captureThread = std::jthread([this](std::stop_token stopToken) {
+		CaptureLoop(stopToken);
+		});
+
+	return S_OK;
 
 // Caller holds the lifecycle mutex, never the event/sample mutex during join.
 void MediaStream::StopCapture()
@@ -165,14 +130,55 @@ HRESULT MediaStream::Stop()
 
 void MediaStream::ReportStreamError(HRESULT error)
 {
-    // Caller holds _lock. Publish one error instead of silently spinning forever.
-    if (FAILED(_streamError) || _shutdown || _state == MF_STREAM_STATE_STOPPED) return;
-    _streamError = error;
-    _latestFrame.reset();
-    _requests.clear();
-    WinTraceFormat(4, 0, L"[AsciiCam] Capture/delivery failed: 0x%08X", error);
-    if (_queue) (void)_queue->QueueEventParamVar(MEError, GUID_NULL, error, nullptr);
-}
+	WINTRACE(L"CaptureLoop Started");
+	while (!stopToken.stop_requested() && _state == MF_STREAM_STATE_RUNNING)
+	{
+		wil::com_ptr_nothrow<IMFSample> webcamSample;
+
+		// 프레임 캡처
+		HRESULT hr = _capture.GetFrame(&webcamSample);
+
+		if (FAILED(hr) || !webcamSample)
+		{
+			WINTRACE(L"GetFrame Failed: 0x%08X", hr);
+
+			// 장치가 끊겼거나 심각한 실패일 경우 루프 탈출 고려
+			if (hr == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED ||
+				hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) ||
+				hr == E_HANDLE)
+			{
+				WINTRACE(L"Webcam device disconnected. (0x%08X)", hr);
+				break;
+			}
+
+			continue;
+		}
+
+		FilterOption requested;
+		if (_filterSubscriber.TryGetUpdate(requested))
+		{
+			HRESULT setHr = _postProcessor.SetOption(requested);
+			WINTRACE(L"Filter switched to %d: 0x%08X", (int)requested, setHr);
+			// Acknowledge only after the switch finished (even on failure, so the producer unblocks).
+			_filterSubscriber.NotifyConsumed();
+		}
+
+		hr = _postProcessor.Process(webcamSample.get());
+		if (FAILED(hr))
+		{
+			WINTRACE(L"Filter Process Failed: 0x%08X", hr);
+			continue;
+		}
+
+		// 최신 프레임 스레드 안전 업데이트
+		{
+			winrt::slim_lock_guard guard(_frameLock);
+			_latestFrame = std::move(webcamSample); // std::move로 Ref-Count 증감 오버헤드 방지
+		}
+	}
+
+	// 스레드 종료 시 캡처 장치 자원 해제
+	_capture.Shutdown();
 
 void MediaStream::CaptureLoop(std::stop_token token)
 {

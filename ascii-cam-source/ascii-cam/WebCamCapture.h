@@ -16,9 +16,11 @@ public:
     ~WebcamCapture();
     HRESULT Initialize(UINT width = 1280, UINT height = 720, UINT fps = 30);
     HRESULT GetFrame(IMFSample** sample);
-    HRESULT GetOutputType(IMFMediaType** type);
-    // Wake GetFrame before joining the capture thread; does not reset COM pointers.
-    void RequestStop();
+
+    // GetOutputType removed: keep WebcamCapture interface minimal. Use
+    // post-processor Initialize(width, height, FilterOption::ASCII) in
+    // MediaStream instead of querying the capture output type here.
+
     void Shutdown();
 
 private:

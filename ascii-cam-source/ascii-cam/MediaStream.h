@@ -4,6 +4,7 @@
 #include "ColorConverter.h"
 #include "FrameGenerator.h"
 #include "Filter.h"
+#include "FilterSubscriber.h"
 #include <winerror.h>
 #include <mferror.h>
 #include <thread>
@@ -160,18 +161,8 @@ private:
 
     Filter _postProcessor;
 
-    // Serializes lifecycle calls; never held by the capture worker.
-    std::mutex _lifecycleMutex;
-    bool _allocatorInitialized = false;
-    bool _shutdown = false;
-    HRESULT _streamError = S_OK;
-    UINT32 _width = 1280;
-    UINT32 _height = 720;
-    LONGLONG _duration = 333333;
-    LONGLONG _baseTime = 0;
-    std::optional<LONGLONG> _firstCaptureTime;
-    std::optional<LONGLONG> _lastDeliveredTime;
-    std::deque<Microsoft::WRL::ComPtr<IUnknown>> _requests;
+    // filter selection published by the controller through shared memory
+    FilterSubscriber _filterSubscriber;
 
     // latest webcam frame
     wil::com_ptr_nothrow<IMFSample> _latestFrame;

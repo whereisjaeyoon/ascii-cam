@@ -460,3 +460,5 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+/target/
