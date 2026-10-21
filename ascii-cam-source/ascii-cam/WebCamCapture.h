@@ -5,36 +5,27 @@
 #include <mfreadwrite.h>
 #include <mfobjects.h>
 #include <wrl/client.h>
+#include <memory>
+
+struct WebcamReadState;
 
 class WebcamCapture
 {
 public:
     WebcamCapture();
     ~WebcamCapture();
-
-    HRESULT Initialize(
-        UINT width = 1280,
-        UINT height = 960,
-        UINT fps = 30
-    );
-
+    HRESULT Initialize(UINT width = 1280, UINT height = 720, UINT fps = 30);
     HRESULT GetFrame(IMFSample** sample);
-
-    HRESULT GetOutputType(IMFMediaType** type)
-    {
-        if (!type) return E_POINTER;
-        *type = nullptr;
-        if (!_reader) return E_UNEXPECTED;
-        return _reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, type);
-    }
-
+    HRESULT GetOutputType(IMFMediaType** type);
+    // Wake GetFrame before joining the capture thread; does not reset COM pointers.
+    void RequestStop();
     void Shutdown();
 
 private:
     Microsoft::WRL::ComPtr<IMFMediaSource> _source;
     Microsoft::WRL::ComPtr<IMFSourceReader> _reader;
-
+    Microsoft::WRL::ComPtr<IMFSourceReaderCallback> _callback;
+    std::shared_ptr<WebcamReadState> _readState;
     UINT _width = 0;
     UINT _height = 0;
-    UINT _fps = 0;
 };

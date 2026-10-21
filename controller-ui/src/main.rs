@@ -3,6 +3,10 @@
 use eframe::egui::{
     self, pos2, vec2, Align2, Color32, FontId, RichText, Sense, Stroke, StrokeKind,
 };
+use std::sync::mpsc::{self, Receiver};
+
+mod devices;
+use devices::CameraDevice;
 
 // UW–Madison Badger Red, with warm neutrals for the rest of the interface.
 const RED: Color32 = Color32::from_rgb(197, 5, 12);
@@ -40,11 +44,15 @@ impl Filter {
     }
 }
 
-// Preview state only: no camera APIs, subprocesses, DLLs or shared memory.
+// Power and filters remain UI-only. Device discovery never starts capture.
 #[derive(Default)]
 struct CameraApp {
     enabled: bool,
     filter: Filter,
+    devices: Vec<CameraDevice>,
+    selected_device: Option<String>,
+    device_scan: Option<Receiver<Result<Vec<CameraDevice>, String>>>,
+    device_error: Option<String>,
 }
 
 impl CameraApp {
@@ -65,7 +73,130 @@ impl CameraApp {
             .text_styles
             .insert(egui::TextStyle::Button, FontId::proportional(14.0));
         cc.egui_ctx.set_style(style);
-        Self::default()
+        let mut app = Self::default();
+        app.refresh_devices(&cc.egui_ctx);
+        app
+    }
+
+    fn refresh_devices(&mut self, ctx: &egui::Context) {
+        if self.device_scan.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        let ctx = ctx.clone();
+        self.device_error = None;
+        self.devices.clear();
+        match std::thread::Builder::new()
+            .name("camera-discovery".into())
+            .spawn(move || {
+                let _ = sender.send(devices::enumerate());
+                ctx.request_repaint();
+            }) {
+            Ok(_) => self.device_scan = Some(receiver),
+            Err(error) => self.device_error = Some(format!("Could not refresh cameras: {error}")),
+        }
+    }
+
+    fn poll_devices(&mut self, ctx: &egui::Context) {
+        let Some(scan) = &self.device_scan else {
+            return;
+        };
+        let result = match scan.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Err("Camera discovery stopped. Try Refresh.".into())
+            }
+        };
+        self.device_scan = None;
+        match result {
+            Ok(devices) => {
+                // Use the symbolic link, not the display name: two cameras can
+                // have identical names. Preserve selection only while present.
+                if !devices
+                    .iter()
+                    .any(|device| Some(&device.id) == self.selected_device.as_ref())
+                {
+                    self.selected_device = None;
+                }
+                self.devices = devices;
+            }
+            Err(error) => {
+                self.selected_device = None;
+                self.device_error = Some(error);
+            }
+        }
+    }
+
+    fn device_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Connected devices").size(18.0).strong());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.device_scan.is_none(), egui::Button::new("Refresh"))
+                    .clicked()
+                {
+                    self.refresh_devices(ui.ctx());
+                }
+            });
+        });
+        ui.label(
+            RichText::new("Physical cameras only. Select a device below.")
+                .size(12.0)
+                .color(MUTED),
+        );
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(Color32::WHITE)
+            .stroke(Stroke::new(1.0_f32, LINE))
+            .corner_radius(10.0)
+            .inner_margin(14.0)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                if self.device_scan.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Looking for cameras...");
+                    });
+                } else if let Some(error) = &self.device_error {
+                    ui.colored_label(RED, error);
+                } else if self.devices.is_empty() {
+                    ui.label("No physical cameras found.");
+                    ui.label(
+                        RichText::new("Connect a camera, then choose Refresh.")
+                            .size(12.0)
+                            .color(MUTED),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("{} camera(s) found", self.devices.len()))
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("device-list")
+                        .max_height(145.0)
+                        .show(ui, |ui| {
+                            for device in &self.devices {
+                                ui.push_id(&device.id, |ui| {
+                                    let selected =
+                                        self.selected_device.as_ref() == Some(&device.id);
+                                    if ui.selectable_label(selected, &device.name).clicked() {
+                                        self.selected_device = Some(device.id.clone());
+                                    }
+                                });
+                            }
+                        });
+                }
+            });
+        ui.label(
+            RichText::new("Device selection only. Video capture is not started.")
+                .size(11.0)
+                .color(MUTED),
+        );
     }
 
     fn power_switch(&mut self, ui: &mut egui::Ui) {
@@ -203,6 +334,7 @@ impl CameraApp {
 
 impl eframe::App for CameraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_devices(ctx);
         egui::TopBottomPanel::top("accent")
             .exact_height(5.0)
             .frame(egui::Frame::new().fill(RED))
@@ -231,6 +363,10 @@ impl eframe::App for CameraApp {
                             .color(MUTED),
                     );
                     ui.add_space(20.0);
+                    ui.separator();
+                    ui.add_space(13.0);
+                    self.device_panel(ui);
+                    ui.add_space(13.0);
                     ui.separator();
                     ui.add_space(13.0);
                     ui.horizontal(|ui| {
@@ -280,7 +416,7 @@ impl eframe::App for CameraApp {
                         ui.label(RichText::new(self.filter.label()).size(12.0).strong());
                     });
                     ui.label(
-                        RichText::new("Preview only. Camera is not connected.")
+                        RichText::new("Power and filters are UI-only. No video capture.")
                             .size(11.0)
                             .color(MUTED),
                     );
@@ -292,7 +428,7 @@ impl eframe::App for CameraApp {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([540.0, 650.0])
+            .with_inner_size([540.0, 850.0])
             .with_min_inner_size([500.0, 620.0]),
         ..Default::default()
     };

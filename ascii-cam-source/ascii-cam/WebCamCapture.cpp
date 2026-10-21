@@ -1,347 +1,275 @@
 #include "pch.h"
-#include "WebcamCapture.h"
-#include <d3d11.h> 
-#include <mfapi.h>
-
-#include <mferror.h>
+#include "WebCamCapture.h"
+// pch.h/WIL defines GUID_NULL as a __uuidof expression. WRL includes
+// cguid.h, which declares a GUID_NULL variable. Hide only this macro while
+// parsing those SDK declarations, then restore the project's definition.
+#pragma push_macro("GUID_NULL")
+#undef GUID_NULL
+#include <cguid.h>
+#include <wrl/implements.h>
+#include <wrl/ftm.h>
+#pragma pop_macro("GUID_NULL")
+#include <d3d10.h>
+#include <d3d11.h>
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cwctype>
+#include <mutex>
+#include <new>
+#include <string>
 
 using Microsoft::WRL::ComPtr;
 
-WebcamCapture::WebcamCapture()
+// Owned independently of WebcamCapture, so late reader callbacks cannot touch a
+// destroyed capture object. At most one asynchronous read is outstanding.
+struct WebcamReadState
 {
+    std::mutex mutex;
+    std::condition_variable ready;
+    bool stopped = false;
+    bool complete = false;
+    HRESULT status = S_OK;
+    DWORD flags = 0;
+    LONGLONG timestamp = 0;
+    ComPtr<IMFSample> sample;
+};
+
+namespace
+{
+    class ReaderCallback final : public Microsoft::WRL::RuntimeClass<
+        Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IMFSourceReaderCallback, Microsoft::WRL::FtmBase>
+    {
+    public:
+        explicit ReaderCallback(std::shared_ptr<WebcamReadState> state) : _state(std::move(state)) {}
+
+        STDMETHODIMP OnReadSample(HRESULT status, DWORD, DWORD flags,
+            LONGLONG timestamp, IMFSample* sample) override
+        {
+            std::lock_guard<std::mutex> lock(_state->mutex);
+            if (!_state->stopped)
+            {
+                _state->status = status;
+                _state->flags = flags;
+                _state->timestamp = timestamp;
+                _state->sample = sample;
+                _state->complete = true;
+                _state->ready.notify_all();
+            }
+            return S_OK;
+        }
+        STDMETHODIMP OnFlush(DWORD) override { return S_OK; }
+        STDMETHODIMP OnEvent(DWORD, IMFMediaEvent*) override { return S_OK; }
+    private:
+        std::shared_ptr<WebcamReadState> _state;
+    };
+
+    bool IsVirtualCamera(IMFActivate* device, const std::wstring& displayName)
+    {
+        // Do not let Ascii Cam capture itself. Names alone are insufficient:
+        // only accept devices which Windows explicitly marks as hardware.
+        UINT32 hardware = FALSE;
+        if (FAILED(device->GetUINT32(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_HW_SOURCE, &hardware)) || !hardware)
+            return true;
+        std::wstring name = displayName;
+        std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return std::towlower(c); });
+        for (const auto* marker : { L"virtual", L"ascii cam", L"ascii-cam", L"obs camera",
+            L"manycam", L"snap camera", L"xsplit", L"splitcam", L"mmhmm" })
+            if (name.find(marker) != std::wstring::npos) return true;
+        return false;
+    }
 }
 
-WebcamCapture::~WebcamCapture()
+WebcamCapture::WebcamCapture() = default;
+WebcamCapture::~WebcamCapture() { Shutdown(); }
+
+HRESULT WebcamCapture::Initialize(UINT width, UINT height, UINT fps)
 {
     Shutdown();
-}
-HRESULT WebcamCapture::Initialize(
-    UINT width,
-    UINT height,
-    UINT fps
-)
-{
-    HRESULT hr = S_OK;
-
+    RETURN_HR_IF(E_INVALIDARG, !width || !height || (width % 2) || (height % 2) || !fps);
     _width = width;
     _height = height;
-    _fps = fps;
-
-    // 1. 디바이스 속성 생성
     wil::com_ptr_nothrow<IMFAttributes> attributes;
-    hr = MFCreateAttributes(&attributes, 1);
-    if (FAILED(hr)) return hr;
+    RETURN_IF_FAILED(MFCreateAttributes(&attributes, 1));
+    RETURN_IF_FAILED(attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID));
 
-    hr = attributes->SetGUID(
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID
-    );
-    if (FAILED(hr)) return hr;
-
-    // 2. 비디오 캡처 장치 열거
     IMFActivate** devices = nullptr;
     UINT32 count = 0;
-    hr = MFEnumDeviceSources(attributes.get(), &devices, &count);
-    if (FAILED(hr)) return hr;
-
-    if (count == 0)
-    {
-        CoTaskMemFree(devices);
-        return E_FAIL;
-    }
-
-    // 3. 실제 카메라 찾기 (가상 카메라 제외)
-    bool found = false;
-    for (UINT32 i = 0; i < count; i++)
+    RETURN_IF_FAILED(MFEnumDeviceSources(attributes.get(), &devices, &count));
+    HRESULT activationResult = MF_E_NOT_FOUND;
+    for (UINT32 i = 0; i < count; ++i)
     {
         WCHAR* name = nullptr;
-        UINT32 cchName = 0;
-
-        hr = devices[i]->GetAllocatedString(
-            MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME,
-            &name,
-            &cchName
-        );
-        if (FAILED(hr)) continue;
-
-        WINTRACE(L"Camera Found: %s", name);
-
-        bool isVirtual = (wcsstr(name, L"Virtual") != nullptr) ||
-                         (wcsstr(name, L"가상") != nullptr);
-
-        if (isVirtual)
+        UINT32 length = 0;
+        if (SUCCEEDED(devices[i]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &name, &length)))
         {
-            WINTRACE(L"Skipping Virtual Camera: %s", name);
+            WinTraceFormat(4, 0, L"[Wcam] Found: %s", name);
+            if (!_source && !IsVirtualCamera(devices[i], name))
+            {
+                activationResult = devices[i]->ActivateObject(IID_PPV_ARGS(&_source));
+                if (SUCCEEDED(activationResult)) WinTraceFormat(4, 0, L"[Wcam] Selected physical camera: %s", name);
+            }
             CoTaskMemFree(name);
-            continue;
         }
-
-        hr = devices[i]->ActivateObject(IID_PPV_ARGS(&_source));
-        CoTaskMemFree(name);
-
-        if (SUCCEEDED(hr))
-        {
-            found = true;
-            break;
-        }
-    }
-
-    // 디바이스 리소스 해제
-    for (UINT32 i = 0; i < count; i++)
-    {
         devices[i]->Release();
     }
     CoTaskMemFree(devices);
+    RETURN_HR_IF(activationResult, !_source);
 
-    if (!found) return E_FAIL;
-
-    // 3-2. D3D 11 & DXGI MGM 생성 시도
-    wil::com_ptr_nothrow<IMFDXGIDeviceManager> dxgiManager;
-    UINT resetToken = 0;
-    bool isGpuAccelerated = false;
-
-    wil::com_ptr_nothrow<ID3D11Device> d3d11Device;
-    wil::com_ptr_nothrow<ID3D11DeviceContext> d3d11Context;
-    D3D_FEATURE_LEVEL featureLevel;
-
-    // D3D11 디바이스 생성 시도
-    HRESULT hrD3D = D3D11CreateDevice(
-        nullptr,
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,
+    // Require a real D3D11 device; no WARP or CPU retry for video processing.
+    ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11DeviceContext> context;
+    D3D_FEATURE_LEVEL level;
+    RETURN_IF_FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-        nullptr, 0,
-        D3D11_SDK_VERSION,
-        &d3d11Device,
-        &featureLevel,
-        &d3d11Context
-    );
+        nullptr, 0, D3D11_SDK_VERSION, &device, &level, &context));
+    ComPtr<ID3D10Multithread> multithread;
+    RETURN_IF_FAILED(device.As(&multithread));
+    multithread->SetMultithreadProtected(TRUE);
+    UINT token = 0;
+    ComPtr<IMFDXGIDeviceManager> manager;
+    RETURN_IF_FAILED(MFCreateDXGIDeviceManager(&token, &manager));
+    RETURN_IF_FAILED(manager->ResetDevice(device.Get(), token));
 
-    if (SUCCEEDED(hrD3D) && d3d11Device)
-    {
-        // Media Foundation 스레드 안전성 확보
-        wil::com_ptr_nothrow<ID3D10Multithread> multiThread;
-        if (SUCCEEDED(d3d11Device->QueryInterface(IID_PPV_ARGS(&multiThread))))
-        {
-            multiThread->SetMultithreadProtected(TRUE);
-        }
-
-        // DXGI Device Manager 생성 시도
-        HRESULT hrDXGI = MFCreateDXGIDeviceManager(&resetToken, &dxgiManager);
-        if (SUCCEEDED(hrDXGI) && dxgiManager)
-        {
-            if (SUCCEEDED(dxgiManager->ResetDevice(d3d11Device.get(), resetToken)))
-            {
-                isGpuAccelerated = true;
-                WINTRACE(L"[Wcam] GPU Acceleration Enabled (Direct3D 11).");
-            }
-            else
-            {
-                dxgiManager.reset();
-                WINTRACE(L"[Wcam] DXGI ResetDevice failed. Falling back to CPU mode.");
-            }
-        }
-        else
-        {
-            WINTRACE(L"[Wcam] DXGI Device Manager creation failed. Falling back to CPU mode.");
-        }
-    }
-    else
-    {
-        WINTRACE(L"[Wcam] D3D11 Device creation failed (hr = 0x%08X). Falling back to CPU mode.", hrD3D);
-    }
-
-    // 3-3. apply CPU/CPU attribute
+    try { _readState = std::make_shared<WebcamReadState>(); }
+    catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+    auto callback = Microsoft::WRL::Make<ReaderCallback>(_readState);
+    RETURN_HR_IF(E_OUTOFMEMORY, !callback);
+    RETURN_IF_FAILED(callback.As(&_callback));
     wil::com_ptr_nothrow<IMFAttributes> readerAttributes;
-    hr = MFCreateAttributes(&readerAttributes, 4);
-    if (FAILED(hr)) return hr;
+    RETURN_IF_FAILED(MFCreateAttributes(&readerAttributes, 4));
+    RETURN_IF_FAILED(readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE));
+    RETURN_IF_FAILED(readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE));
+    RETURN_IF_FAILED(readerAttributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, manager.Get()));
+    RETURN_IF_FAILED(readerAttributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, _callback.Get()));
+    RETURN_IF_FAILED(MFCreateSourceReaderFromMediaSource(_source.Get(), readerAttributes.get(), &_reader));
+    RETURN_IF_FAILED(_reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE));
+    RETURN_IF_FAILED(_reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE));
 
-    // 하드웨어 디코더 가속 요청
-    readerAttributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
-    readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
-
-    // GPU가 사용 가능한 경우 DXGI Manager 바인딩
-    if (isGpuAccelerated && dxgiManager)
+    // Choose an exact-size mode. Prefer native NV12, then uncompressed YUY2;
+    // never silently feed a different resolution or packed YUY2 into the filter.
+    DWORD bestIndex = MAXDWORD;
+    UINT32 bestScore = 0;
+    for (DWORD index = 0; ; ++index)
     {
-        readerAttributes->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, dxgiManager.get());
+        ComPtr<IMFMediaType> native;
+        const HRESULT hr = _reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, index, &native);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        RETURN_IF_FAILED(hr);
+        UINT32 w = 0, h = 0, num = 0, den = 0;
+        GUID format = GUID_NULL;
+        if (FAILED(MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &w, &h)) ||
+            FAILED(MFGetAttributeRatio(native.Get(), MF_MT_FRAME_RATE, &num, &den)) ||
+            FAILED(native->GetGUID(MF_MT_SUBTYPE, &format)) || !den || !num || w != width || h != height ||
+            static_cast<UINT64>(num) != static_cast<UINT64>(fps) * den)
+            continue;
+        const UINT32 rate = num / den;
+        // Favor the requested rate, then closest rate, within the format tier.
+        const UINT32 difference = rate > fps ? rate - fps : fps - rate;
+        const UINT32 rateScore = 1000 - (std::min)(difference, 999u);
+        const UINT32 formatScore = format == MFVideoFormat_NV12 ? 3000 :
+            format == MFVideoFormat_YUY2 ? 2000 : 1000;
+        const UINT32 score = formatScore + rateScore;
+        if (bestIndex == MAXDWORD || score > bestScore) { bestIndex = index; bestScore = score; }
     }
-
-
-    // 4. Source Reader 생성
-    hr = MFCreateSourceReaderFromMediaSource(_source.Get(), readerAttributes.get(), &_reader);
-
-    // GPU 속성 결합으로 생성이 실패한 경우 CPU 전용 속성으로 재시도 (2차 Fallback)
-    if (FAILED(hr) && isGpuAccelerated)
+    if (bestIndex == MAXDWORD)
     {
-        WINTRACE(L"[Wcam] Reader creation failed with GPU attributes. Retrying in CPU mode...");
-        readerAttributes->DeleteItem(MF_SOURCE_READER_D3D_MANAGER);
-        isGpuAccelerated = false;
-        dxgiManager.reset();
-
-        hr = MFCreateSourceReaderFromMediaSource(_source.Get(), readerAttributes.get(), &_reader);
+        WinTraceFormat(4, 0, L"[Wcam] No native %ux%u @ %u fps mode. Refusing a mismatched fallback.", width, height, fps);
+        return MF_E_INVALIDMEDIATYPE;
     }
+    ComPtr<IMFMediaType> native;
+    RETURN_IF_FAILED(_reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, bestIndex, &native));
+    RETURN_IF_FAILED(_reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, native.Get()));
 
-    if (FAILED(hr)) return hr;
-
-    // 5. [개선] 단일 루프로 최고 FPS 포맷 탐색
-    DWORD typeIndex = 0;
-    DWORD bestTypeIndex = DWORD_MAX;
-    UINT32 maxFpsFound = 0;
-    bool bestIsYUY2 = false;
-
-    // Fallback용 변수 (해상도가 안 맞을 때 대비)
-    DWORD fallbackTypeIndex = DWORD_MAX;
-    UINT32 fallbackMaxFps = 0;
-
-    while (true)
-    {
-        wil::com_ptr_nothrow<IMFMediaType> nativeType;
-        hr = _reader->GetNativeMediaType(
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-            typeIndex,
-            &nativeType
-        );
-
-        if (FAILED(hr)) break; // 탐색 완료
-
-        GUID subtype = GUID_NULL;
-        UINT32 w = 0, h = 0;
-        UINT32 num = 0, den = 0;
-
-        nativeType->GetGUID(MF_MT_SUBTYPE, &subtype);
-        MFGetAttributeSize(nativeType.get(), MF_MT_FRAME_SIZE, &w, &h);
-        MFGetAttributeRatio(nativeType.get(), MF_MT_FRAME_RATE, &num, &den);
-
-        UINT32 currentFps = (den > 0) ? (num / den) : 0;
-
-        WCHAR guidText[64];
-        StringFromGUID2(subtype, guidText, ARRAYSIZE(guidText));
-        WINTRACE(L"[Wcam] NativeType %u -> %s %ux%u @ %ufps", typeIndex, guidText, w, h, currentFps);
-
-        // 조건 A: 요청한 해상도(width x height)와 일치하는 경우
-        if (w == width && h == height)
-        {
-            // 1. 더 높은 FPS를 찾았거나
-            // 2. FPS가 같은데 디코딩이 필요 없는 YUY2인 경우 우선 선택
-            if (currentFps > maxFpsFound ||
-               (currentFps == maxFpsFound && subtype == MFVideoFormat_YUY2 && !bestIsYUY2))
-            {
-                maxFpsFound = currentFps;
-                bestTypeIndex = typeIndex;
-                bestIsYUY2 = (subtype == MFVideoFormat_YUY2);
-            }
-        }
-
-        // 조건 B: Fallback (YUY2 중 가장 FPS가 높은 것)
-        if (subtype == MFVideoFormat_YUY2 && currentFps > fallbackMaxFps)
-        {
-            fallbackMaxFps = currentFps;
-            fallbackTypeIndex = typeIndex;
-        }
-
-        typeIndex++;
-    }
-
-    // 6. [개선] 최적의 포맷 적용 및 자동 YUY2 디코더 설정
-    DWORD targetIndex = bestTypeIndex;
-    bool targetIsYUY2 = bestIsYUY2;
-
-    // 요청 해상도가 없을 경우 Fallback 적용
-    if (targetIndex == DWORD_MAX)
-    {
-        if (fallbackTypeIndex != DWORD_MAX)
-        {
-            targetIndex = fallbackTypeIndex;
-            targetIsYUY2 = true;
-            WINTRACE(L"[Wcam] Exact resolution not found. Using Fallback YUY2.");
-        }
-        else
-        {
-            WINTRACE(L"[Wcam] No compatible format found.");
-            return E_FAIL;
-        }
-    }
-
-    // A. 카메라 하드웨어 출력 포맷 설정 (예: 30fps MJPEG 선택)
-    wil::com_ptr_nothrow<IMFMediaType> selectedNativeType;
-    hr = _reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, targetIndex, &selectedNativeType);
-    if (FAILED(hr)) return hr;
-
-    hr = _reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, selectedNativeType.get());
-    if (FAILED(hr)) return hr;
-
-    // Native 포맷이 YUY2/NV12가 아닌 경우 (예: MJPEG) -> 항상 NV12로 디코딩
-    if (!targetIsYUY2)
-    {
-        wil::com_ptr_nothrow<IMFMediaType> outputType;
-        hr = MFCreateMediaType(&outputType);
-        if (FAILED(hr)) return hr;
-
-        hr = outputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        if (FAILED(hr)) return hr;
-
-        // [통일] GPU/CPU 구분 없이 항상 NV12로 출력 세팅
-        hr = outputType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-        if (FAILED(hr)) return hr;
-
-        hr = MFSetAttributeSize(outputType.get(), MF_MT_FRAME_SIZE, width, height);
-        if (FAILED(hr)) return hr;
-
-        hr = MFSetAttributeRatio(outputType.get(), MF_MT_FRAME_RATE, maxFpsFound, 1);
-        if (FAILED(hr)) return hr;
-
-        // 디코더 출력 포맷 적용
-        hr = _reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outputType.get());
-        if (FAILED(hr)) return hr;
-
-        WINTRACE(L"[Wcam] Decoder Configured (%s): Native (%u fps) -> Output (NV12, %ux%u)",
-            isGpuAccelerated ? L"GPU HW" : L"CPU SW", maxFpsFound, width, height);
-    }
-
+    ComPtr<IMFMediaType> output;
+    RETURN_IF_FAILED(MFCreateMediaType(&output));
+    RETURN_IF_FAILED(output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
+    RETURN_IF_FAILED(output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
+    RETURN_IF_FAILED(MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, width, height));
+    RETURN_IF_FAILED(output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
+    // Leave frame rate to the native mode; its timestamps/durations are retained.
+    RETURN_IF_FAILED(_reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, output.Get()));
+    ComPtr<IMFMediaType> actual;
+    RETURN_IF_FAILED(GetOutputType(&actual));
+    GUID format = GUID_NULL;
+    UINT32 w = 0, h = 0;
+    RETURN_IF_FAILED(actual->GetGUID(MF_MT_SUBTYPE, &format));
+    RETURN_IF_FAILED(MFGetAttributeSize(actual.Get(), MF_MT_FRAME_SIZE, &w, &h));
+    RETURN_HR_IF(MF_E_INVALIDMEDIATYPE, format != MFVideoFormat_NV12 || w != width || h != height);
+    WinTraceFormat(4, 0, L"[Wcam] NV12 output verified: %ux%u; D3D11 enabled.", w, h);
     return S_OK;
+}
+
+HRESULT WebcamCapture::GetOutputType(IMFMediaType** type)
+{
+    RETURN_HR_IF_NULL(E_POINTER, type);
+    *type = nullptr;
+    RETURN_HR_IF(E_UNEXPECTED, !_reader);
+    return _reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, type);
 }
 
 HRESULT WebcamCapture::GetFrame(IMFSample** sample)
 {
     RETURN_HR_IF_NULL(E_POINTER, sample);
-
     *sample = nullptr;
-
-    DWORD streamIndex = 0;
-    DWORD flags = 0;
-    LONGLONG timestamp = 0;
-
-    HRESULT hr = _reader->ReadSample(
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        0,
-        &streamIndex,
-        &flags,
-        &timestamp,
-        sample
-    );
-
-    RETURN_IF_FAILED(hr);
-
-    if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
+    RETURN_HR_IF(E_UNEXPECTED, !_reader || !_readState);
+    auto state = _readState;
     {
-        return E_FAIL;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopped) return MF_E_SHUTDOWN;
+        state->complete = false;
+        state->sample.Reset();
     }
-
-    if (!*sample)
+    RETURN_IF_FAILED(_reader->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
+        nullptr, nullptr, nullptr, nullptr));
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->ready.wait_for(lock, std::chrono::seconds(5), [&] { return state->complete || state->stopped; }))
+        return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    if (state->stopped) return MF_E_SHUTDOWN;
+    RETURN_IF_FAILED(state->status);
+    if (state->flags & MF_SOURCE_READERF_ERROR) return E_FAIL;
+    if (state->flags & MF_SOURCE_READERF_ENDOFSTREAM) return MF_E_END_OF_STREAM;
+    const DWORD flags = state->flags;
+    const LONGLONG timestamp = state->timestamp;
+    auto frame = state->sample;
+    lock.unlock();
+    if (flags & (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED | MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED))
     {
-        return E_FAIL;
+        ComPtr<IMFMediaType> type;
+        RETURN_IF_FAILED(GetOutputType(&type));
+        GUID format = GUID_NULL;
+        UINT32 width = 0, height = 0, num = 0, den = 0;
+        RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &format));
+        RETURN_IF_FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height));
+        RETURN_IF_FAILED(MFGetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, &num, &den));
+        RETURN_HR_IF(MF_E_INVALIDMEDIATYPE, format != MFVideoFormat_NV12 ||
+            width != _width || height != _height || !den || static_cast<UINT64>(num) != 30ull * den);
     }
+    // Stream ticks are valid and carry no sample. The next read may have one.
+    if (!frame) return S_FALSE;
+    RETURN_IF_FAILED(frame->SetSampleTime(timestamp));
+    return frame.CopyTo(sample);
+}
 
-    return S_OK;
+void WebcamCapture::RequestStop()
+{
+    if (_readState)
+    {
+        std::lock_guard<std::mutex> lock(_readState->mutex);
+        _readState->stopped = true;
+        _readState->ready.notify_all();
+    }
+    // Do not wait for a driver read to finish just to join the capture thread.
+    // Flush is asynchronous when the reader has a callback.
+    if (_reader) (void)_reader->Flush(MF_SOURCE_READER_ALL_STREAMS);
 }
 
 void WebcamCapture::Shutdown()
 {
+    RequestStop();
     _reader.Reset();
-
-    if (_source)
-    {
-        _source->Shutdown();
-        _source.Reset();
-    }
+    if (_source) { (void)_source->Shutdown(); _source.Reset(); }
+    _callback.Reset();
+    _readState.reset();
 }

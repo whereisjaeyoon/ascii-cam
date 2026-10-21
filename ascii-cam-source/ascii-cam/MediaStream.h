@@ -7,6 +7,9 @@
 #include <winerror.h>
 #include <mferror.h>
 #include <thread>
+#include <deque>
+#include <mutex>
+#include <optional>
 
 struct MediaStream :
     winrt::implements<
@@ -96,6 +99,8 @@ public:
         SetBaseAttributesTraceName(L"MediaStreamAtts");
     }
 
+    ~MediaStream() { Shutdown(); }
+
     HRESULT Initialize(
         IMFMediaSource* source,
         int index
@@ -122,6 +127,10 @@ public:
 private:
 
     void CaptureLoop(std::stop_token stopToken);
+    // Called only with _lock held. Requests are FIFO, including null tokens.
+    HRESULT DeliverSample(IMFSample* frame, IUnknown* token);
+    void ReportStreamError(HRESULT error);
+    void StopCapture();
 
 #if _DEBUG
 
@@ -151,11 +160,21 @@ private:
 
     Filter _postProcessor;
 
+    // Serializes lifecycle calls; never held by the capture worker.
+    std::mutex _lifecycleMutex;
+    bool _allocatorInitialized = false;
+    bool _shutdown = false;
+    HRESULT _streamError = S_OK;
+    UINT32 _width = 1280;
+    UINT32 _height = 720;
+    LONGLONG _duration = 333333;
+    LONGLONG _baseTime = 0;
+    std::optional<LONGLONG> _firstCaptureTime;
+    std::optional<LONGLONG> _lastDeliveredTime;
+    std::deque<Microsoft::WRL::ComPtr<IUnknown>> _requests;
+
     // latest webcam frame
     wil::com_ptr_nothrow<IMFSample> _latestFrame;
-
-    // protects latest frame
-    winrt::slim_mutex _frameLock;
 
     // existing MF lock
     winrt::slim_mutex _lock;

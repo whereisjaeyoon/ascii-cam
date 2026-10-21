@@ -5,594 +5,436 @@
 #include "MFTools.h"
 #include "MediaStream.h"
 #include "MediaSource.h"
-#include "WebCamCapture.h"       // fixed casing to match the real header file
-#include "Filter.h"
+#include "Nv12Layout.h"
+#include <vector>
+#include <new>
+#include <system_error>
+
+#define NUM_IMAGE_COLS 1280
+#define NUM_IMAGE_ROWS 720
 
 HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 {
-	RETURN_HR_IF_NULL(E_POINTER, source);
-	_source = source;
-	_index = index;
-		
-	RETURN_IF_FAILED(SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE));
-	RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_STREAM_ID, index));
-	RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1));
-	RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes::MFFrameSourceTypes_Color));
+    RETURN_HR_IF_NULL(E_POINTER, source);
+    _source = source;
+    _index = index;
+    RETURN_IF_FAILED(SetGUID(MF_DEVICESTREAM_STREAM_CATEGORY, PINNAME_VIDEO_CAPTURE));
+    RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_STREAM_ID, index));
+    RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_FRAMESERVER_SHARED, 1));
+    RETURN_IF_FAILED(SetUINT32(MF_DEVICESTREAM_ATTRIBUTE_FRAMESOURCE_TYPES, MFFrameSourceTypes_Color));
+    RETURN_IF_FAILED(MFCreateEventQueue(&_queue));
 
-	RETURN_IF_FAILED(MFCreateEventQueue(&_queue));
-
-	// set 1 here to force RGB32 only
-	auto types = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(2);
-
-#define NUM_IMAGE_COLS 1280 // 640
-#define NUM_IMAGE_ROWS 720 //480
-
-	wil::com_ptr_nothrow<IMFMediaType> rgbType;
-	RETURN_IF_FAILED(MFCreateMediaType(&rgbType));
-	rgbType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-	rgbType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-	MFSetAttributeSize(rgbType.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-	rgbType->SetUINT32(MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS * 4);
-	rgbType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-	rgbType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-	MFSetAttributeRatio(rgbType.get(), MF_MT_FRAME_RATE, 30, 1);
-	auto bitrate = (uint32_t)(NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 4 * 8 * 30);
-	rgbType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-	MFSetAttributeRatio(rgbType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-	types[0] = rgbType.detach();
-
-	if (types.size() > 1)
-	{
-		wil::com_ptr_nothrow<IMFMediaType> nv12Type;
-		RETURN_IF_FAILED(MFCreateMediaType(&nv12Type));
-		nv12Type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-		nv12Type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-		nv12Type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-		nv12Type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-		MFSetAttributeSize(nv12Type.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-		nv12Type->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT)(NUM_IMAGE_COLS * 1.5));
-		MFSetAttributeRatio(nv12Type.get(), MF_MT_FRAME_RATE, 30, 1);
-		// frame size * pixel bit size * framerate
-		bitrate = (uint32_t)(NUM_IMAGE_COLS * 1.5 * NUM_IMAGE_ROWS * 8 * 30);
-		nv12Type->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-		MFSetAttributeRatio(nv12Type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-		types[1] = nv12Type.detach();
-	}
-
-	RETURN_IF_FAILED_MSG(MFCreateStreamDescriptor(_index, (DWORD)types.size(), types.get(), &_descriptor), "MFCreateStreamDescriptor failed");
-
-	wil::com_ptr_nothrow<IMFMediaTypeHandler> handler;
-	RETURN_IF_FAILED(_descriptor->GetMediaTypeHandler(&handler));
-	TraceMFAttributes(handler.get(), L"MediaTypeHandler");
-	RETURN_IF_FAILED(handler->SetCurrentMediaType(types[1]));
-
-	return S_OK;
+    // Until an RGB32 conversion is implemented, advertise ONLY the format that
+    // is actually delivered. NV12 stride is width, not width * 1.5.
+    wil::com_ptr_nothrow<IMFMediaType> type;
+    RETURN_IF_FAILED(MFCreateMediaType(&type));
+    RETURN_IF_FAILED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video));
+    RETURN_IF_FAILED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12));
+    RETURN_IF_FAILED(MFSetAttributeSize(type.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_FIXED_SIZE_SAMPLES, TRUE));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_SAMPLE_SIZE, NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 3 / 2));
+    RETURN_IF_FAILED(type->SetUINT32(MF_MT_AVG_BITRATE, NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 12 * 30));
+    RETURN_IF_FAILED(MFSetAttributeRatio(type.get(), MF_MT_FRAME_RATE, 30, 1));
+    RETURN_IF_FAILED(MFSetAttributeRatio(type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1));
+    IMFMediaType* types[] = { type.get() };
+    RETURN_IF_FAILED(MFCreateStreamDescriptor(index, 1, types, &_descriptor));
+    wil::com_ptr_nothrow<IMFMediaTypeHandler> handler;
+    RETURN_IF_FAILED(_descriptor->GetMediaTypeHandler(&handler));
+    RETURN_IF_FAILED(handler->SetCurrentMediaType(type.get()));
+    _format = MFVideoFormat_NV12;
+    return S_OK;
 }
 
-HRESULT MediaStream::Start(IMFMediaType* type)
+HRESULT MediaStream::Start(IMFMediaType* requestedType)
 {
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator);
-	UINT32 width = 1280, height = 720;
-	UINT32 fpsNumerator = 30, fpsDenominator = 1;
-	if (type)
-	{
-		RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &_format));
-		MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
-		MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &fpsNumerator, &fpsDenominator);
-		WINTRACE(L"MediaStream::Start - Format: %s, Resolution: %dx%d, FPS: %d",
-			GUID_ToStringW(_format).c_str(), width, height,
-			(fpsDenominator > 0 ? fpsNumerator / fpsDenominator : 30));
-	}
-	UINT32 framerate = (fpsDenominator > 0) ? (fpsNumerator / fpsDenominator) : 30;
-	RETURN_IF_FAILED(_capture.Initialize(width, height, framerate));
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    {
+        winrt::slim_lock_guard lock(_lock);
+        RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_queue || !_allocator);
+        if (_state == MF_STREAM_STATE_RUNNING) return _streamError;
+        if (_state == MF_STREAM_STATE_PAUSED)
+        {
+            _state = MF_STREAM_STATE_RUNNING;
+            return _queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr);
+        }
+    }
+    // Also support SetStreamState(RUNNING), which has no media-type argument.
+    wil::com_ptr_nothrow<IMFMediaType> type;
+    if (requestedType)
+        RETURN_IF_FAILED(requestedType->QueryInterface(IID_PPV_ARGS(&type)));
+    else
+    {
+        wil::com_ptr_nothrow<IMFMediaTypeHandler> handler;
+        RETURN_IF_FAILED(_descriptor->GetMediaTypeHandler(&handler));
+        RETURN_IF_FAILED(handler->GetCurrentMediaType(&type));
+    }
+    GUID format = GUID_NULL;
+    UINT32 width = 0, height = 0, num = 0, den = 0;
+    RETURN_IF_FAILED(type->GetGUID(MF_MT_SUBTYPE, &format));
+    RETURN_IF_FAILED(MFGetAttributeSize(type.get(), MF_MT_FRAME_SIZE, &width, &height));
+    RETURN_IF_FAILED(MFGetAttributeRatio(type.get(), MF_MT_FRAME_RATE, &num, &den));
+    RETURN_HR_IF(MF_E_INVALIDMEDIATYPE, format != MFVideoFormat_NV12 ||
+        width != NUM_IMAGE_COLS || height != NUM_IMAGE_ROWS || num != 30 || den != 1);
 
-	wil::com_ptr_nothrow<IMFMediaType> captureType;
-    RETURN_IF_FAILED(_capture.GetOutputType(&captureType));
-    RETURN_IF_FAILED(_postProcessor.Initialize(width, height, FilterOption::Grayscale, captureType.get()));
+    const HRESULT hr = [&]() -> HRESULT
+    {
+        RETURN_IF_FAILED(_capture.Initialize(width, height, num / den));
+        wil::com_ptr_nothrow<IMFMediaType> captureType;
+        RETURN_IF_FAILED(_capture.GetOutputType(&captureType));
+        // Grayscale now uses a D3D11 compute shader, not a CPU pixel loop.
+        RETURN_IF_FAILED(_postProcessor.Initialize(width, height, FilterOption::Grayscale, captureType.get()));
+        RETURN_IF_FAILED(_allocator->InitializeSampleAllocator(10, type.get()));
+        _allocatorInitialized = true;
+        UINT32 captureNum = num, captureDen = den;
+        (void)MFGetAttributeRatio(captureType.get(), MF_MT_FRAME_RATE, &captureNum, &captureDen);
+        UINT64 duration = 0;
+        RETURN_IF_FAILED(MFFrameRateToAverageTimePerFrame(captureNum, captureDen, &duration));
+        {
+            winrt::slim_lock_guard lock(_lock);
+            _width = width;
+            _height = height;
+            _format = format;
+            _duration = static_cast<LONGLONG>(duration);
+            _baseTime = MFGetSystemTime();
+            _firstCaptureTime.reset();
+            _lastDeliveredTime.reset();
+            _latestFrame.reset();
+            _requests.clear();
+            _streamError = S_OK;
+            _state = MF_STREAM_STATE_RUNNING;
+            RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr));
+        }
+        try
+        {
+            _captureThread = std::jthread([this](std::stop_token token) { CaptureLoop(token); });
+        }
+        catch (const std::system_error&) { return E_FAIL; }
+        catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
+        WinTraceFormat(4, 0, L"[AsciiCam] Stream started: NV12 %ux%u; GPU grayscale.", width, height);
+        return S_OK;
+    }();
+    if (FAILED(hr))
+    {
+        {
+            winrt::slim_lock_guard lock(_lock);
+            _state = MF_STREAM_STATE_STOPPED;
+            _streamError = hr;
+            (void)_queue->QueueEventParamVar(MEError, GUID_NULL, hr, nullptr);
+        }
+        StopCapture();
+        WinTraceFormat(4, 0, L"[AsciiCam] Stream initialization failed: 0x%08X", hr);
+    }
+    return hr;
+}
 
-	RETURN_IF_FAILED(
-		_allocator->InitializeSampleAllocator(
-			10,
-			type
-		)
-	);
-
-	_state = MF_STREAM_STATE_RUNNING;
-	HRESULT hr = _queue->QueueEventParamVar(
-		MEStreamStarted,
-		GUID_NULL,
-		S_OK,
-		nullptr
-	);
-	if (FAILED(hr))
-	{
-		// 이벤트 발송 실패 시 롤백 처리
-		_state = MF_STREAM_STATE_STOPPED;
-		_postProcessor.Shutdown();
-		_capture.Shutdown();
-		return hr;
-	}
-	_captureThread = std::jthread([this](std::stop_token stopToken) {
-		CaptureLoop(stopToken);
-		});
-
-	return S_OK;
-
-	// at this point, set D3D manager may have not been called
-	// so we want to create a D2D1 renter target anyway
-	// original
-	//RETURN_IF_FAILED(_generator.EnsureRenderTarget(NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
-	//RETURN_IF_FAILED(_capture.Initialize());
-	//RETURN_IF_FAILED(_allocator->InitializeSampleAllocator(10, type));
-	//RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr));
-	//_state = MF_STREAM_STATE_RUNNING;
-	//return S_OK;
+// Caller holds the lifecycle mutex, never the event/sample mutex during join.
+void MediaStream::StopCapture()
+{
+    if (_captureThread.joinable())
+    {
+        _captureThread.request_stop();
+        _capture.RequestStop();
+        _captureThread.join();
+    }
+    _capture.Shutdown();
+    _postProcessor.Shutdown();
+    if (_allocatorInitialized && _allocator)
+    {
+        LOG_IF_FAILED(_allocator->UninitializeSampleAllocator());
+        _allocatorInitialized = false;
+    }
 }
 
 HRESULT MediaStream::Stop()
 {
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue || !_allocator);
-	if (_captureThread.joinable())
-	{
-		_captureThread.join();
-	}
-
-	_capture.Shutdown();
-	RETURN_IF_FAILED(_allocator->UninitializeSampleAllocator());
-	RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr));
-	_state = MF_STREAM_STATE_STOPPED;
-	return S_OK;
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    {
+        winrt::slim_lock_guard lock(_lock);
+        RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_queue);
+        _state = MF_STREAM_STATE_STOPPED;
+        _requests.clear();
+        _latestFrame.reset();
+    }
+    StopCapture();
+    winrt::slim_lock_guard lock(_lock);
+    return _queue->QueueEventParamVar(MEStreamStopped, GUID_NULL, S_OK, nullptr);
 }
 
-void MediaStream::CaptureLoop(std::stop_token stopToken)
+void MediaStream::ReportStreamError(HRESULT error)
 {
-	WINTRACE(L"CaptureLoop Started");
-	while (!stopToken.stop_requested() && _state == MF_STREAM_STATE_RUNNING)
-	{
-		wil::com_ptr_nothrow<IMFSample> webcamSample;
+    // Caller holds _lock. Publish one error instead of silently spinning forever.
+    if (FAILED(_streamError) || _shutdown || _state == MF_STREAM_STATE_STOPPED) return;
+    _streamError = error;
+    _latestFrame.reset();
+    _requests.clear();
+    WinTraceFormat(4, 0, L"[AsciiCam] Capture/delivery failed: 0x%08X", error);
+    if (_queue) (void)_queue->QueueEventParamVar(MEError, GUID_NULL, error, nullptr);
+}
 
-		// 프레임 캡처
-		HRESULT hr = _capture.GetFrame(&webcamSample);
-
-		if (FAILED(hr) || !webcamSample)
-		{
-			WINTRACE(L"GetFrame Failed: 0x%08X", hr);
-
-			// 장치가 끊겼거나 심각한 실패일 경우 루프 탈출 고려
-			if (hr == MF_E_VIDEO_RECORDING_DEVICE_INVALIDATED ||
-				hr == HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED) ||
-				hr == E_HANDLE)
-			{
-				WINTRACE(L"Webcam device disconnected. (0x%08X)", hr);
-				break;
-			}
-
-			continue;
-		}
-
-		hr = _postProcessor.Process(webcamSample.get());
-		if (FAILED(hr))
-		{
-			WINTRACE(L"Filter Process Failed: 0x%08X", hr);
-			continue;
-		}
-
-		// 최신 프레임 스레드 안전 업데이트
-		{
-			winrt::slim_lock_guard guard(_frameLock);
-			_latestFrame = std::move(webcamSample); // std::move로 Ref-Count 증감 오버헤드 방지
-		}
-	}
-
-	// 스레드 종료 시 캡처 장치 자원 해제
-	_capture.Shutdown();
-
-	WINTRACE(L"CaptureLoop Ended");
+void MediaStream::CaptureLoop(std::stop_token token)
+{
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(comResult))
+    {
+        winrt::slim_lock_guard lock(_lock);
+        ReportStreamError(comResult);
+        return;
+    }
+    try
+    {
+        while (!token.stop_requested())
+        {
+            wil::com_ptr_nothrow<IMFSample> frame;
+            HRESULT hr = _capture.GetFrame(&frame);
+            if (token.stop_requested()) break;
+            if (hr == S_FALSE) continue;
+            if (SUCCEEDED(hr)) hr = _postProcessor.Process(frame.get());
+            winrt::slim_lock_guard lock(_lock);
+            if (token.stop_requested() || _shutdown || _state == MF_STREAM_STATE_STOPPED) break;
+            if (FAILED(hr)) { ReportStreamError(hr); break; }
+            _latestFrame = std::move(frame);
+            if (_state == MF_STREAM_STATE_RUNNING && !_requests.empty())
+            {
+                hr = DeliverSample(_latestFrame.get(), _requests.front().Get());
+                if (FAILED(hr)) { ReportStreamError(hr); break; }
+                _requests.pop_front();
+                _latestFrame.reset();
+            }
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        winrt::slim_lock_guard lock(_lock);
+        ReportStreamError(E_OUTOFMEMORY);
+    }
+    CoUninitialize();
 }
 
 MFSampleAllocatorUsage MediaStream::GetAllocatorUsage()
 {
-	return MFSampleAllocatorUsage_UsesProvidedAllocator;
+    return MFSampleAllocatorUsage_UsesProvidedAllocator;
 }
 
 HRESULT MediaStream::SetAllocator(IUnknown* allocator)
 {
-	RETURN_HR_IF_NULL(E_POINTER, allocator);
-	_allocator.reset();
-	RETURN_HR(allocator->QueryInterface(&_allocator));
+    RETURN_HR_IF_NULL(E_POINTER, allocator);
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown);
+    RETURN_HR_IF(MF_E_INVALIDREQUEST, _allocatorInitialized);
+    return allocator->QueryInterface(IID_PPV_ARGS(&_allocator));
 }
 
 HRESULT MediaStream::SetD3DManager(IUnknown* manager)
 {
-	RETURN_HR_IF_NULL(E_POINTER, manager);
-
-	// comment these 2 lines to force CPU usage
-	RETURN_IF_FAILED(_allocator->SetDirectXManager(manager));
-	RETURN_IF_FAILED(_generator.SetD3DManager(manager, NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, manager);
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_allocator);
+    // FrameGenerator is unused in the live path. Do not initialize its unrelated
+    // D2D resources while configuring the sample allocator.
+    return _allocator->SetDirectXManager(manager);
 }
 
 void MediaStream::Shutdown()
 {
-	if (_queue)
-	{
-		LOG_IF_FAILED_MSG(_queue->Shutdown(), "Queue shutdown failed");
-		_queue.reset();
-	}
-
-	_descriptor.reset();
-	_source.reset();
-	_attributes.reset();
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    {
+        winrt::slim_lock_guard lock(_lock);
+        if (_shutdown) return;
+        _shutdown = true;
+        _state = MF_STREAM_STATE_STOPPED;
+        _requests.clear();
+        _latestFrame.reset();
+    }
+    StopCapture();
+    winrt::slim_lock_guard lock(_lock);
+    if (_queue) { (void)_queue->Shutdown(); _queue.reset(); }
+    _descriptor.reset();
+    _source.reset();
+    _allocator.reset();
+    _attributes.reset();
 }
 
-// IMFMediaEventGenerator
-STDMETHODIMP MediaStream::BeginGetEvent(IMFAsyncCallback* pCallback, IUnknown* punkState)
+// Snapshot the queue before calling potentially blocking event operations.
+// Holding _lock inside GetEvent would prevent the capture worker from delivering.
+STDMETHODIMP MediaStream::BeginGetEvent(IMFAsyncCallback* callback, IUnknown* state)
 {
-	//WINTRACE(L"MediaSource::BeginGetEvent");
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue);
-
-	RETURN_IF_FAILED(_queue->BeginGetEvent(pCallback, punkState));
-	return S_OK;
+    wil::com_ptr_nothrow<IMFMediaEventQueue> queue;
+    { winrt::slim_lock_guard lock(_lock); queue = _queue; }
+    RETURN_HR_IF(MF_E_SHUTDOWN, !queue);
+    return queue->BeginGetEvent(callback, state);
 }
-
-STDMETHODIMP MediaStream::EndGetEvent(IMFAsyncResult* pResult, IMFMediaEvent** ppEvent)
+STDMETHODIMP MediaStream::EndGetEvent(IMFAsyncResult* result, IMFMediaEvent** event)
 {
-	//WINTRACE(L"MediaStream::EndGetEvent");
-	RETURN_HR_IF_NULL(E_POINTER, ppEvent);
-	*ppEvent = nullptr;
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue);
-
-	RETURN_IF_FAILED(_queue->EndGetEvent(pResult, ppEvent));
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, event);
+    *event = nullptr;
+    wil::com_ptr_nothrow<IMFMediaEventQueue> queue;
+    { winrt::slim_lock_guard lock(_lock); queue = _queue; }
+    RETURN_HR_IF(MF_E_SHUTDOWN, !queue);
+    return queue->EndGetEvent(result, event);
 }
-
-STDMETHODIMP MediaStream::GetEvent(DWORD dwFlags, IMFMediaEvent** ppEvent)
+STDMETHODIMP MediaStream::GetEvent(DWORD flags, IMFMediaEvent** event)
 {
-	WINTRACE(L"MediaStream::GetEvent");
-	RETURN_HR_IF_NULL(E_POINTER, ppEvent);
-	*ppEvent = nullptr;
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue);
-
-	RETURN_IF_FAILED(_queue->GetEvent(dwFlags, ppEvent));
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, event);
+    *event = nullptr;
+    wil::com_ptr_nothrow<IMFMediaEventQueue> queue;
+    { winrt::slim_lock_guard lock(_lock); queue = _queue; }
+    RETURN_HR_IF(MF_E_SHUTDOWN, !queue);
+    return queue->GetEvent(flags, event);
 }
-
-STDMETHODIMP MediaStream::QueueEvent(MediaEventType met, REFGUID guidExtendedType, HRESULT hrStatus, const PROPVARIANT* pvValue)
+STDMETHODIMP MediaStream::QueueEvent(MediaEventType type, REFGUID extended, HRESULT status, const PROPVARIANT* value)
 {
-	WINTRACE(L"MediaStream::QueueEvent");
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_queue);
-
-	RETURN_IF_FAILED(_queue->QueueEventParamVar(met, guidExtendedType, hrStatus, pvValue));
-	return S_OK;
+    wil::com_ptr_nothrow<IMFMediaEventQueue> queue;
+    { winrt::slim_lock_guard lock(_lock); queue = _queue; }
+    RETURN_HR_IF(MF_E_SHUTDOWN, !queue);
+    return queue->QueueEventParamVar(type, extended, status, value);
 }
-
-// IMFMediaStream
-STDMETHODIMP MediaStream::GetMediaSource(IMFMediaSource** ppMediaSource)
+STDMETHODIMP MediaStream::GetMediaSource(IMFMediaSource** source)
 {
-	WINTRACE(L"MediaSource::GetMediaSource");
-	RETURN_HR_IF_NULL(E_POINTER, ppMediaSource);
-	*ppMediaSource = nullptr;
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_source);
-
-	RETURN_IF_FAILED(_source.copy_to(ppMediaSource));
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, source);
+    *source = nullptr;
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_source);
+    return _source.copy_to(source);
 }
-
-STDMETHODIMP MediaStream::GetStreamDescriptor(IMFStreamDescriptor** ppStreamDescriptor)
+STDMETHODIMP MediaStream::GetStreamDescriptor(IMFStreamDescriptor** descriptor)
 {
-	WINTRACE(L"MediaStream::GetStreamDescriptor");
-	RETURN_HR_IF_NULL(E_POINTER, ppStreamDescriptor);
-	*ppStreamDescriptor = nullptr;
-	winrt::slim_lock_guard lock(_lock);
-	RETURN_HR_IF(MF_E_SHUTDOWN, !_descriptor);
-
-	RETURN_IF_FAILED(_descriptor.copy_to(ppStreamDescriptor));
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, descriptor);
+    *descriptor = nullptr;
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_descriptor);
+    return _descriptor.copy_to(descriptor);
 }
 
-STDMETHODIMP MediaStream::RequestSample(
-	IUnknown* pToken
-)
+HRESULT MediaStream::DeliverSample(IMFSample* frame, IUnknown* token)
 {
-	winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF_NULL(E_POINTER, frame);
+    wil::com_ptr_nothrow<IMFMediaBuffer> input;
+    RETURN_IF_FAILED(frame->ConvertToContiguousBuffer(&input));
+    Nv12Layout packedLayout;
+    RETURN_HR_IF(MF_E_INVALIDMEDIATYPE, !Nv12Layout::TryCreate(_width, _height, _width, packedLayout));
+    const DWORD packedLength = packedLayout.packedBytes;
+    std::vector<BYTE> packed(packedLength);
+    wil::com_ptr_nothrow<IMF2DBuffer> input2D;
+    if (SUCCEEDED(input->QueryInterface(IID_PPV_ARGS(&input2D))))
+    {
+        RETURN_IF_FAILED(input2D->ContiguousCopyTo(packed.data(), packedLength));
+    }
+    else
+    {
+        BYTE* bytes = nullptr;
+        DWORD length = 0;
+        RETURN_IF_FAILED(input->Lock(&bytes, nullptr, &length));
+        // For linear buffers, use the actual capture stride, not output stride.
+        wil::com_ptr_nothrow<IMFMediaType> captureType;
+        HRESULT hr = _capture.GetOutputType(&captureType);
+        const UINT32 stride = SUCCEEDED(hr) ? MFGetAttributeUINT32(captureType.get(), MF_MT_DEFAULT_STRIDE, _width) : 0;
+        if (SUCCEEDED(hr))
+        {
+            Nv12Layout inputLayout;
+            if (!Nv12Layout::TryCreate(_width, _height, stride, inputLayout) || inputLayout.footprint > length)
+                hr = MF_E_BUFFERTOOSMALL;
+            else hr = MFCopyImage(packed.data(), _width, bytes, static_cast<LONG>(stride), _width, _height * 3 / 2);
+        }
+        const HRESULT unlock = input->Unlock();
+        RETURN_IF_FAILED(hr);
+        RETURN_IF_FAILED(unlock);
+    }
 
-	RETURN_HR_IF(
-		MF_E_SHUTDOWN,
-		!_queue
-	);
-
-	//
-	// latest webcam frame
-	//
-	wil::com_ptr_nothrow<IMFSample> webcamSample;
-
-	{
-		winrt::slim_lock_guard guard(_frameLock);
-
-		webcamSample = _latestFrame;
-	}
-
-	if (!webcamSample)
-	{
-		return S_OK;
-	}
-
-	//
-	// source buffer
-	//
-	wil::com_ptr_nothrow<IMFMediaBuffer> srcBuffer;
-
-	RETURN_IF_FAILED(
-		webcamSample->ConvertToContiguousBuffer(
-			&srcBuffer
-		)
-	);
-
-	BYTE* src = nullptr;
-
-	DWORD srcMax = 0;
-	DWORD srcCur = 0;
-
-	RETURN_IF_FAILED(
-		srcBuffer->Lock(
-			&src,
-			&srcMax,
-			&srcCur
-		)
-	);
-
-	//
-	// create output sample
-	//
-	wil::com_ptr_nothrow<IMFSample> sample;
-
-	RETURN_IF_FAILED(
-		MFCreateSample(&sample)
-	);
-
-	//
-	// create NV12 buffer
-	//
-	wil::com_ptr_nothrow<IMFMediaBuffer> dstBuffer;
-
-	RETURN_IF_FAILED(
-		MFCreateMemoryBuffer(
-			srcCur,
-			&dstBuffer
-		)
-	);
-
-	BYTE* dst = nullptr;
-
-	DWORD dstMax = 0;
-	DWORD dstCur = 0;
-
-	RETURN_IF_FAILED(
-		dstBuffer->Lock(
-			&dst,
-			&dstMax,
-			&dstCur
-		)
-	);
-
-	//
-	// copy frame
-	//
-	CopyMemory(
-		dst,
-		src,
-		srcCur
-	);
-
-	RETURN_IF_FAILED(
-		dstBuffer->SetCurrentLength(
-			srcCur
-		)
-	);
-
-	srcBuffer->Unlock();
-	dstBuffer->Unlock();
-
-	//
-	// attach buffer
-	//
-	RETURN_IF_FAILED(
-		sample->AddBuffer(
-			dstBuffer.get()
-		)
-	);
-
-	//
-	// timestamps
-	//
-	RETURN_IF_FAILED(
-		sample->SetSampleTime(
-			MFGetSystemTime()
-		)
-	);
-
-	RETURN_IF_FAILED(
-		sample->SetSampleDuration(
-			333333
-		)
-	);
-
-	//
-	// token
-	//
-	if (pToken)
-	{
-		RETURN_IF_FAILED(
-			sample->SetUnknown(
-				MFSampleExtension_Token,
-				pToken
-			)
-		);
-	}
-
-	//
-	// send to virtual camera client
-	//
-	RETURN_IF_FAILED(
-		_queue->QueueEventParamUnk(
-			MEMediaSample,
-			GUID_NULL,
-			S_OK,
-			sample.get()
-		)
-	);
-
-	return S_OK;
+    // Honor UsesProvidedAllocator, including DXGI surfaces supplied by FrameServer.
+    wil::com_ptr_nothrow<IMFSample> output;
+    RETURN_IF_FAILED(_allocator->AllocateSample(&output));
+    wil::com_ptr_nothrow<IMFMediaBuffer> destination;
+    RETURN_IF_FAILED(output->GetBufferByIndex(0, &destination));
+    wil::com_ptr_nothrow<IMF2DBuffer> destination2D;
+    if (SUCCEEDED(destination->QueryInterface(IID_PPV_ARGS(&destination2D))))
+    {
+        RETURN_IF_FAILED(destination2D->ContiguousCopyFrom(packed.data(), packedLength));
+    }
+    else
+    {
+        BYTE* bytes = nullptr;
+        DWORD capacity = 0;
+        RETURN_IF_FAILED(destination->Lock(&bytes, &capacity, nullptr));
+        const HRESULT hr = capacity < packedLength ? MF_E_BUFFERTOOSMALL :
+            MFCopyImage(bytes, _width, packed.data(), _width, _width, _height * 3 / 2);
+        const HRESULT unlock = destination->Unlock();
+        RETURN_IF_FAILED(hr);
+        RETURN_IF_FAILED(unlock);
+    }
+    RETURN_IF_FAILED(destination->SetCurrentLength(packedLength));
+    LONGLONG duration = _duration, captureTime = 0;
+    (void)frame->GetSampleDuration(&duration);
+    if (duration <= 0) duration = _duration;
+    RETURN_IF_FAILED(frame->GetSampleTime(&captureTime));
+    if (!_firstCaptureTime) _firstCaptureTime = captureTime;
+    LONGLONG timestamp = _baseTime + (captureTime - *_firstCaptureTime);
+    if (_lastDeliveredTime && timestamp <= *_lastDeliveredTime)
+        timestamp = *_lastDeliveredTime + duration;
+    RETURN_IF_FAILED(output->SetSampleTime(timestamp));
+    RETURN_IF_FAILED(output->SetSampleDuration(duration));
+    // Allocator samples can be recycled; always remove any old request token.
+    (void)output->DeleteItem(MFSampleExtension_Token);
+    RETURN_IF_FAILED(output->SetUINT32(MFSampleExtension_Discontinuity, !_lastDeliveredTime.has_value()));
+    if (token) RETURN_IF_FAILED(output->SetUnknown(MFSampleExtension_Token, token));
+    RETURN_IF_FAILED(_queue->QueueEventParamUnk(MEMediaSample, GUID_NULL, S_OK, output.get()));
+    if (!_lastDeliveredTime) WinTraceFormat(4, 0, L"[AsciiCam] First NV12 sample delivered (%u bytes).", packedLength);
+    _lastDeliveredTime = timestamp;
+    return S_OK;
 }
 
-//STDMETHODIMP MediaStream::RequestSample(IUnknown* pToken)
-//{
-//	winrt::slim_lock_guard lock(_lock);
-//
-//	RETURN_HR_IF(MF_E_SHUTDOWN, !_allocator || !_queue);
-//
-//	wil::com_ptr_nothrow<IMFSample> sample;
-//
-//	RETURN_IF_FAILED(
-//		_allocator->AllocateSample(&sample)
-//	);
-//
-//	wil::com_ptr_nothrow<IMFSample> webcamSample;
-//
-//	RETURN_IF_FAILED(
-//		_capture.GetFrame(&webcamSample)
-//	);
-//
-//	if (!webcamSample)
-//	{
-//		return E_FAIL;
-//	}
-//
-//	wil::com_ptr_nothrow<IMFMediaBuffer> srcBuffer;
-//	wil::com_ptr_nothrow<IMFMediaBuffer> dstBuffer;
-//
-//	RETURN_IF_FAILED(
-//		webcamSample->GetBufferByIndex(
-//			0,
-//			&srcBuffer
-//		)
-//	);
-//
-//	RETURN_IF_FAILED(
-//		sample->GetBufferByIndex(
-//			0,
-//			&dstBuffer
-//		)
-//	);
-//
-//	BYTE* src = nullptr;
-//	BYTE* dst = nullptr;
-//
-//	DWORD srcMax = 0;
-//	DWORD srcCur = 0;
-//
-//	DWORD dstMax = 0;
-//	DWORD dstCur = 0;
-//
-//	RETURN_IF_FAILED(
-//		srcBuffer->Lock(
-//			&src,
-//			&srcMax,
-//			&srcCur
-//		)
-//	);
-//
-//	RETURN_IF_FAILED(
-//		dstBuffer->Lock(
-//			&dst,
-//			&dstMax,
-//			&dstCur
-//		)
-//	);
-//
-//	if (srcCur > dstMax)
-//	{
-//		srcBuffer->Unlock();
-//		dstBuffer->Unlock();
-//		return E_FAIL;
-//	}
-//
-//	CopyMemory(
-//		dst,
-//		src,
-//		srcCur
-//	);
-//
-//	RETURN_IF_FAILED(
-//		dstBuffer->SetCurrentLength(srcCur)
-//	);
-//
-//	srcBuffer->Unlock();
-//	dstBuffer->Unlock();
-//
-//	sample->SetSampleTime(MFGetSystemTime());
-//	sample->SetSampleDuration(333333);
-//
-//	if (pToken)
-//	{
-//		sample->SetUnknown(
-//			MFSampleExtension_Token,
-//			pToken
-//		);
-//	}
-//
-//	RETURN_IF_FAILED(
-//		_queue->QueueEventParamUnk(
-//			MEMediaSample,
-//			GUID_NULL,
-//			S_OK,
-//			sample.get()
-//		)
-//	);
-//
-//	return S_OK;
-//}
+STDMETHODIMP MediaStream::RequestSample(IUnknown* token)
+{
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_queue || !_allocator);
+    RETURN_HR_IF(MF_E_INVALIDREQUEST, _state == MF_STREAM_STATE_STOPPED);
+    RETURN_IF_FAILED(_streamError);
+    // Never return S_OK without remembering the request. A first-frame race
+    // previously discarded this request and left the client waiting forever.
+    RETURN_HR_IF(MF_E_NOTACCEPTING, _requests.size() >= 32);
+    try
+    {
+        _requests.emplace_back(token);
+        if (_state == MF_STREAM_STATE_RUNNING && _latestFrame)
+        {
+            const HRESULT hr = DeliverSample(_latestFrame.get(), _requests.front().Get());
+            if (FAILED(hr)) { ReportStreamError(hr); return hr; }
+            _requests.pop_front();
+            _latestFrame.reset();
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        ReportStreamError(E_OUTOFMEMORY);
+        return E_OUTOFMEMORY;
+    }
+    return S_OK;
+}
 
-// IMFMediaStream2
 STDMETHODIMP MediaStream::SetStreamState(MF_STREAM_STATE value)
 {
-	WINTRACE(L"MediaStream::SetStreamState current:%u value:%u", _state, value);
-	if (_state = value)
-		return S_OK;
-	switch (value)
-	{
-	case MF_STREAM_STATE_PAUSED:
-		if (_state != MF_STREAM_STATE_RUNNING)
-			RETURN_HR(MF_E_INVALID_STATE_TRANSITION);
-
-		_state = value;
-		break;
-
-	case MF_STREAM_STATE_RUNNING:
-		RETURN_IF_FAILED(Start(nullptr));
-		break;
-
-	case MF_STREAM_STATE_STOPPED:
-		RETURN_IF_FAILED(Stop());
-		break;
-
-	default:
-		RETURN_HR(MF_E_INVALID_STATE_TRANSITION);
-		break;
-	}
-	return S_OK;
+    if (value == MF_STREAM_STATE_RUNNING) return Start(nullptr);
+    if (value == MF_STREAM_STATE_STOPPED) return Stop();
+    std::lock_guard<std::mutex> lifecycle(_lifecycleMutex);
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown || !_queue);
+    if (_state == value) return S_OK; // Comparison, not assignment.
+    RETURN_HR_IF(MF_E_INVALID_STATE_TRANSITION,
+        value != MF_STREAM_STATE_PAUSED || _state != MF_STREAM_STATE_RUNNING);
+    _state = value;
+    return _queue->QueueEventParamVar(MEStreamPaused, GUID_NULL, S_OK, nullptr);
 }
-
 STDMETHODIMP MediaStream::GetStreamState(MF_STREAM_STATE* value)
 {
-	WINTRACE(L"MediaStream::GetStreamState state:%u", _state);
-	RETURN_HR_IF_NULL(E_POINTER, value);
-	*value = _state;
-	return S_OK;
+    RETURN_HR_IF_NULL(E_POINTER, value);
+    winrt::slim_lock_guard lock(_lock);
+    RETURN_HR_IF(MF_E_SHUTDOWN, _shutdown);
+    *value = _state;
+    return S_OK;
 }
 
 // IKsControl
