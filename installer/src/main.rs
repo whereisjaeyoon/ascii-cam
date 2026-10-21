@@ -1,25 +1,25 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+mod model;
 mod pe;
+mod transaction;
+mod ui;
 #[cfg(windows)]
 mod windows;
+mod payload {
+    include!(concat!(env!("OUT_DIR"), "/payload.rs"));
+}
 
-fn main() -> std::process::ExitCode {
-    #[cfg(windows)]
-    let result = windows::run();
-    #[cfg(not(windows))]
-    let result: Result<(), Box<dyn std::error::Error>> =
-        Err("This installer runs on 64-bit Windows only.".into());
-
-    let code = match result {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("ERROR: {error}");
-            std::process::ExitCode::FAILURE
-        }
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([760.0, 700.0])
+            .with_min_inner_size([710.0, 650.0]),
+        ..Default::default()
     };
-    // An elevated child has its own console. Keep its result readable.
-    if std::env::args_os().any(|arg| arg == "--elevated") {
-        println!("Press Enter to close.");
-        let _ = std::io::stdin().read_line(&mut String::new());
-    }
-    code
+    eframe::run_native(
+        "ASCII Cam Setup",
+        options,
+        Box::new(|cc| Ok(Box::new(ui::SetupApp::new(cc)))),
+    )
 }

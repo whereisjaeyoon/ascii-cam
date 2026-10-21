@@ -1,337 +1,551 @@
+use crate::{
+    model::{self, Asset, Event, InstallManifest, Operation, CLIENT, DLL, HOST, MANIFEST, SETUP},
+    transaction::{reject_link, FileTransaction},
+};
 use std::{
     error::Error,
-    ffi::{OsStr, OsString},
     fs, io,
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
+    sync::mpsc::Sender,
 };
-use windows_sys::Win32::{
-    Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT},
-    UI::{
-        Shell::{IsUserAnAdmin, ShellExecuteW},
-        WindowsAndMessaging::SW_SHOWNORMAL,
+use windows::{
+    core::{Interface, PCWSTR},
+    Win32::{
+        Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT},
+        System::Com::{
+            CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IPersistFile,
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        },
+        UI::Shell::{
+            FOLDERID_CommonPrograms, FOLDERID_ProgramFilesX64, FOLDERID_PublicDesktop, IShellLinkW,
+            IsUserAnAdmin, SHGetKnownFolderPath, ShellLink, KF_FLAG_DEFAULT,
+        },
     },
 };
 use winreg::{enums::*, RegKey, RegValue};
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
-const CLSID: &str = r"SOFTWARE\Classes\CLSID\{3CAD447D-F283-4AF4-A3B2-6F5363309F52}";
+type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const COM: &str = r"SOFTWARE\Classes\CLSID\{3CAD447D-F283-4AF4-A3B2-6F5363309F52}\InprocServer32";
+const CLSID: &str = r"SOFTWARE\Classes\CLSID\{3CAD447D-F283-4AF4-A3B2-6F5363309F52}";
 const APP: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\AsciiCam";
-const SETUP: &str = "ascii-cam-setup.exe";
+const APP_VALUES: &[&str] = &[
+    "DisplayName",
+    "DisplayVersion",
+    "InstallLocation",
+    "UninstallString",
+    "DisplayIcon",
+    "NoModify",
+    "NoRepair",
+    "EstimatedSize",
+    "InstallerKind",
+];
 
-fn wide(s: &OsStr) -> Vec<u16> {
-    s.encode_wide().chain(Some(0)).collect()
-}
-fn text(path: &Path) -> Result<String> {
-    Ok(path.to_str().ok_or("Path is not valid Unicode")?.to_owned())
-}
-fn quoted(value: &OsStr) -> OsString {
-    // Windows command-line quoting: double backslashes before quotes and at end.
-    let mut result = OsString::from("\"");
-    let mut slashes = 0;
-    for ch in value.to_string_lossy().chars() {
-        if ch == '\\' {
-            slashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            result.push("\\".repeat(slashes * 2 + 1));
-        } else {
-            result.push("\\".repeat(slashes));
-        }
-        result.push(ch.to_string());
-        slashes = 0;
-    }
-    result.push("\\".repeat(slashes * 2));
-    result.push("\"");
-    result
-}
-fn elevate(args: &[OsString]) -> Result<()> {
-    let exe = wide(std::env::current_exe()?.as_os_str());
-    let cwd = wide(std::env::current_dir()?.as_os_str());
-    let mut command = OsString::new();
-    for arg in args {
-        command.push(quoted(arg));
-        command.push(" ");
-    }
-    command.push("--elevated");
-    let args = wide(&command);
-    let verb = wide(OsStr::new("runas"));
-    // SAFETY: all UTF-16 strings are NUL terminated and live through this call.
-    let result = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            verb.as_ptr(),
-            exe.as_ptr(),
-            args.as_ptr(),
-            cwd.as_ptr(),
-            SW_SHOWNORMAL,
-        )
-    } as isize;
-    if result <= 32 {
-        return Err(format!(
-            "Administrator permission was not granted (ShellExecute code {result})."
-        )
-        .into());
-    }
-    println!("Opened the administrator installer window. Check that window for the result.");
-    Ok(())
-}
-
-fn directory() -> Result<PathBuf> {
-    let base = std::env::var_os("ProgramW6432")
-        .or_else(|| std::env::var_os("ProgramFiles"))
-        .ok_or("Program Files location not found")?;
-    Ok(PathBuf::from(base).join("AsciiCam"))
-}
-
-type Snapshot = Option<Vec<(String, RegValue)>>;
-fn snapshot(path: &str) -> Result<Snapshot> {
-    match RegKey::predef(HKEY_LOCAL_MACHINE)
-        .open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY)
-    {
-        Ok(key) => Ok(Some(key.enum_values().collect::<io::Result<Vec<_>>>()?)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-fn restore(path: &str, values: &Snapshot) -> Result<()> {
-    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
-    match root.delete_subkey_all(path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e.into()),
-    }
-    if let Some(values) = values {
-        let (key, _) = root.create_subkey_with_flags(path, KEY_WRITE | KEY_WOW64_64KEY)?;
-        for (name, value) in values {
-            key.set_raw_value(name, value)?;
+// Machine-wide installation is serialized across simultaneous Setup windows.
+struct SetupMutex(windows::Win32::Foundation::HANDLE);
+impl SetupMutex {
+    fn acquire() -> Result<Self> {
+        use windows::Win32::{
+            Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0},
+            System::Threading::{CreateMutexW, WaitForSingleObject},
+        };
+        let name: Vec<u16> = "Global\\AsciiCam.Setup.3CAD447D-F283-4AF4-A3B2-6F5363309F52"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        unsafe {
+            let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))?;
+            let status = WaitForSingleObject(handle, 0);
+            if status != WAIT_OBJECT_0 && status != WAIT_ABANDONED {
+                let _ = CloseHandle(handle);
+                return Err("Another ASCII Cam installation or removal is running.".into());
+            }
+            Ok(Self(handle))
         }
     }
-    Ok(())
 }
-fn file_snapshot(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+impl Drop for SetupMutex {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
     }
-}
-fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let temporary = path.with_extension(format!("install-{}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result: io::Result<()> = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
-    drop(file);
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
-}
-fn restore_file(path: &Path, bytes: &Option<Vec<u8>>) -> Result<()> {
-    if let Some(bytes) = bytes {
-        replace_file(path, bytes)?;
-    } else if path.exists() {
-        fs::remove_file(path)?;
-    }
-    Ok(())
 }
 
-fn install(source: &Path) -> Result<()> {
-    let bytes = fs::read(source).map_err(|e| format!("Cannot read {}: {e}", source.display()))?;
-    super::pe::validate(&bytes)?;
-    let dir = directory()?;
-    let dll = dir.join("ascii-cam.dll");
-    let setup = dir.join(SETUP);
-    let this_exe = std::env::current_exe()?.canonicalize()?;
-    let copy_setup = !setup.exists() || setup.canonicalize()? != this_exe;
-    let prior_com = snapshot(COM)?;
-    let prior_app = snapshot(APP)?;
-    let prior_dll = file_snapshot(&dll)?;
-    let prior_setup = if copy_setup {
-        file_snapshot(&setup)?
-    } else {
-        None
-    };
-    fs::create_dir_all(&dir)?;
-    let mut dll_written = false;
-    let mut setup_written = false;
-    let mut registry_changed = false;
-    let outcome: Result<()> = (|| {
-        // No DLL is loaded here. An in-use DLL fails with an actionable error.
-        replace_file(&dll,&bytes).map_err(|e| format!("Cannot replace {}: {e}. Close Camera/Zoom/OBS and the camera host; reboot if it remains in use.",dll.display()))?;
-        dll_written = true;
-        if copy_setup {
-            replace_file(&setup, &fs::read(&this_exe)?)?;
-            setup_written = true;
+struct Com;
+impl Com {
+    fn initialize() -> Result<Self> {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         }
-        registry_changed = true;
+        Ok(Self)
+    }
+}
+impl Drop for Com {
+    fn drop(&mut self) {
+        unsafe { CoUninitialize() }
+    }
+}
+fn wide(path: &Path) -> Vec<u16> {
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+fn string(path: &Path) -> Result<String> {
+    Ok(path
+        .to_str()
+        .ok_or("Installation path is not Unicode")?
+        .into())
+}
+fn known_folder(id: &windows::core::GUID) -> Result<PathBuf> {
+    unsafe {
+        let text = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None)?;
+        let converted = text.to_string();
+        CoTaskMemFree(Some(text.0.cast()));
+        Ok(PathBuf::from(converted?))
+    }
+}
+pub fn directory() -> std::result::Result<PathBuf, String> {
+    known_folder(&FOLDERID_ProgramFilesX64)
+        .map(|p| p.join("AsciiCam"))
+        .map_err(|e| e.to_string())
+}
+pub fn installed() -> bool {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(APP, KEY_READ | KEY_WOW64_64KEY)
+        .is_ok()
+}
+pub fn administrator() -> bool {
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+fn progress(tx: &Sender<Event>, fraction: f32, message: &str) {
+    let _ = tx.send(Event::Progress {
+        fraction,
+        message: message.into(),
+    });
+}
+
+#[derive(Default)]
+struct RegistryTransaction {
+    values: Vec<(String, String, Option<RegValue>)>,
+    created: Vec<String>,
+    finished: bool,
+}
+impl RegistryTransaction {
+    fn key(&mut self, path: &str) -> Result<RegKey> {
         let root = RegKey::predef(HKEY_LOCAL_MACHINE);
-        let (key, _) = root.create_subkey_with_flags(COM, KEY_WRITE | KEY_WOW64_64KEY)?;
-        // Matches the inspected camera DLL's DllRegisterServer implementation.
-        key.set_value("", &text(&dll)?)?;
-        key.set_value("ThreadingModel", &"Both")?;
-        let (app, _) = root.create_subkey_with_flags(APP, KEY_WRITE | KEY_WOW64_64KEY)?;
-        app.set_value("DisplayName", &"ASCII Cam")?;
-        app.set_value("DisplayVersion", &env!("CARGO_PKG_VERSION"))?;
-        app.set_value("InstallLocation", &text(&dir)?)?;
-        app.set_value(
-            "UninstallString",
-            &format!("\"{}\" uninstall", text(&setup)?),
-        )?;
-        app.set_value("NoModify", &1u32)?;
-        app.set_value("NoRepair", &1u32)?;
+        let mut prefix = String::new();
+        for segment in path.split('\\') {
+            if !prefix.is_empty() {
+                prefix.push('\\');
+            }
+            prefix.push_str(segment);
+            match root.open_subkey_with_flags(&prefix, KEY_READ | KEY_WOW64_64KEY) {
+                Ok(_) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    root.create_subkey_with_flags(&prefix, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY)?;
+                    self.created.push(prefix.clone());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(root.open_subkey_with_flags(path, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY)?)
+    }
+    fn change(&mut self, path: &str, name: &str, value: Option<RegValue>) -> Result<()> {
+        let key = self.key(path)?;
+        let before = match key.get_raw_value(name) {
+            Ok(v) => Some(v),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(v) = value {
+            key.set_raw_value(name, &v)?;
+        } else if before.is_some() {
+            key.delete_value(name)?;
+        }
+        self.values.push((path.into(), name.into(), before));
         Ok(())
+    }
+    fn text(&mut self, path: &str, name: &str, value: &str) -> Result<()> {
+        use winreg::types::ToRegValue;
+        self.change(path, name, Some(value.to_reg_value()))
+    }
+    fn number(&mut self, path: &str, name: &str, value: u32) -> Result<()> {
+        use winreg::types::ToRegValue;
+        self.change(path, name, Some(value.to_reg_value()))
+    }
+    fn commit(&mut self) {
+        self.finished = true;
+        self.values.clear();
+        self.created.clear();
+    }
+    fn rollback(&mut self) -> Vec<String> {
+        let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let mut failures = Vec::new();
+        for (path, name, before) in self.values.drain(..).rev() {
+            let result: io::Result<()> = (|| {
+                let (key, _) =
+                    root.create_subkey_with_flags(&path, KEY_READ | KEY_WRITE | KEY_WOW64_64KEY)?;
+                if let Some(value) = before {
+                    key.set_raw_value(&name, &value)
+                } else {
+                    match key.delete_value(&name) {
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                        r => r,
+                    }
+                }
+            })();
+            if let Err(e) = result {
+                failures.push(format!("Registry rollback failed for {path}: {e}"));
+            }
+        }
+        for path in self.created.drain(..).rev() {
+            remove_empty_key(&path);
+        }
+        self.finished = true;
+        failures
+    }
+}
+impl Drop for RegistryTransaction {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.rollback();
+        }
+    }
+}
+fn remove_empty_key(path: &str) {
+    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if let Ok(key) = root.open_subkey_with_flags(path, KEY_READ | KEY_WOW64_64KEY) {
+        let empty = key.enum_keys().next().is_none() && key.enum_values().next().is_none();
+        drop(key);
+        if empty {
+            let _ = root.delete_subkey(path);
+        }
+    }
+}
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy()
+        .eq_ignore_ascii_case(&b.to_string_lossy())
+}
+fn shortcut_paths(desktop: bool) -> Result<Vec<(PathBuf, &'static str)>> {
+    let mut locations = vec![known_folder(&FOLDERID_CommonPrograms)?];
+    if desktop {
+        locations.push(known_folder(&FOLDERID_PublicDesktop)?);
+    }
+    let mut result = Vec::new();
+    for directory in locations {
+        reject_link(&directory)?;
+        result.push((directory.join("ASCII Cam Controller.lnk"), CLIENT));
+        result.push((directory.join("ASCII Cam Camera.lnk"), HOST));
+    }
+    Ok(result)
+}
+fn shortcut_bytes(target: &Path, directory: &Path) -> Result<Vec<u8>> {
+    // Generate into a private temporary directory, then install via the same
+    // rollback transaction as the other files. All COM work stays on this worker.
+    let temp = std::env::temp_dir().join(format!(
+        "ascii-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    fs::create_dir(&temp)?;
+    let file = temp.join("shortcut.lnk");
+    let outcome = (|| -> Result<Vec<u8>> {
+        unsafe {
+            let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)?;
+            let target_w = wide(target);
+            let directory_w = wide(directory);
+            link.SetPath(PCWSTR(target_w.as_ptr()))?;
+            link.SetWorkingDirectory(PCWSTR(directory_w.as_ptr()))?;
+            link.SetIconLocation(PCWSTR(target_w.as_ptr()), 0)?;
+            let persist: IPersistFile = link.cast()?;
+            let file_w = wide(&file);
+            persist.Save(PCWSTR(file_w.as_ptr()), true)?;
+        }
+        Ok(fs::read(&file)?)
     })();
-    if let Err(error) = outcome {
-        // Report rollback failures instead of pretending installation was atomic.
-        if registry_changed {
-            for (path, values) in [(COM, &prior_com), (APP, &prior_app)] {
-                if let Err(e) = restore(path, values) {
-                    eprintln!("Registry rollback failed for {path}: {e}");
+    let _ = fs::remove_file(file);
+    let _ = fs::remove_dir(temp);
+    outcome
+}
+fn manifest(dir: &Path) -> Result<Option<InstallManifest>> {
+    let file = dir.join(MANIFEST);
+    reject_link(&file)?;
+    match fs::read(file) {
+        Ok(bytes) => {
+            let value: InstallManifest = serde_json::from_slice(&bytes)?;
+            model::validate_manifest(&value)?;
+            Ok(Some(value))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub fn operate(
+    operation: Operation,
+    desktop: bool,
+    assets: &[Asset],
+    sender: &Sender<Event>,
+) -> std::result::Result<String, String> {
+    let result = (|| -> Result<String> {
+        if !cfg!(target_arch = "x86_64") {
+            return Err("Use the x64 installer.".into());
+        }
+        if !administrator() {
+            return Err("Administrator permission is required. Right-click Setup and choose Run as administrator.".into());
+        }
+        let _mutex = SetupMutex::acquire()?;
+        let _com = Com::initialize()?;
+        if operation == Operation::Install {
+            let key = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+                r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+                KEY_READ | KEY_WOW64_64KEY,
+            )?;
+            let build: String = key.get_value("CurrentBuildNumber")?;
+            if build.parse::<u32>()? < 22000 {
+                return Err("ASCII Cam requires Windows 11 (build 22000 or later).".into());
+            }
+        }
+        let dir = directory()?;
+        reject_link(&dir)?;
+        if operation == Operation::Install {
+            model::validate_assets(assets)?;
+        }
+        let dir_existed = dir.exists();
+        if operation == Operation::Install {
+            fs::create_dir_all(&dir)?;
+        }
+        let mut files = FileTransaction::default();
+        let mut registry = RegistryTransaction::default();
+        let result = match operation {
+            Operation::Install => install(&dir, desktop, assets, sender, &mut files, &mut registry),
+            Operation::Uninstall => uninstall(&dir, sender, &mut files, &mut registry),
+        };
+        match result {
+            Ok(message) => {
+                files.commit();
+                registry.commit();
+                if operation == Operation::Uninstall {
+                    remove_empty_key(COM);
+                    remove_empty_key(CLSID);
+                    remove_empty_key(APP);
+                    let cleanup = cleanup_installer(&dir);
+                    let _ = fs::remove_dir(&dir); // Never recursive; preserve unknown files.
+                    return Ok(format!("{message}{cleanup}"));
+                }
+                Ok(message)
+            }
+            Err(error) => {
+                let mut failures = registry.rollback();
+                failures.extend(files.rollback());
+                if !dir_existed {
+                    let _ = fs::remove_dir(&dir);
+                }
+                if failures.is_empty() {
+                    Err(format!("{error}\n\nChanges from this attempt were rolled back. Close Camera, Zoom, OBS and the camera host before retrying. If the DLL remains locked, restart Windows and install before opening camera apps.").into())
+                } else {
+                    Err(format!(
+                        "{error}\n\nRollback needs attention:\n{}",
+                        failures.join("\n")
+                    )
+                    .into())
                 }
             }
         }
-        if dll_written {
-            if let Err(e) = restore_file(&dll, &prior_dll) {
-                eprintln!("DLL rollback failed: {e}");
-            }
-        }
-        if setup_written {
-            if let Err(e) = restore_file(&setup, &prior_setup) {
-                eprintln!("Installer rollback failed: {e}");
-            }
-        }
-        return Err(error);
-    }
-    println!("Installed DLL: {}", dll.display());
-    println!("COM registration: HKLM\\{COM}");
-    println!("Installed apps entry: ASCII Cam");
-    println!("Installation complete. This does not start the camera or connect the UI.");
-    Ok(())
+    })();
+    result.map_err(|error| error.to_string())
 }
 
-fn uninstall() -> Result<()> {
+fn install(
+    dir: &Path,
+    desktop: bool,
+    assets: &[Asset],
+    tx: &Sender<Event>,
+    files: &mut FileTransaction,
+    registry: &mut RegistryTransaction,
+) -> Result<String> {
+    progress(tx, 0.08, "Checking the installation");
+    let old_manifest = manifest(dir)?;
+    let current = std::env::current_exe()?;
+    let setup = dir.join(SETUP);
+    let mut names: Vec<String> = assets.iter().map(|a| a.name.to_owned()).collect();
+    names.push(SETUP.into());
+    // Prepare shortcut data before modifying installed files.
+    let links = shortcut_paths(desktop)?;
+    let link_data = links
+        .iter()
+        .map(|(path, name)| Ok((path.clone(), shortcut_bytes(&dir.join(name), dir)?)))
+        .collect::<Result<Vec<_>>>()?;
+    for (i, asset) in assets.iter().enumerate() {
+        let message = if asset.name == CLIENT {
+            "Installing the controller"
+        } else if asset.name == HOST {
+            "Installing the camera host"
+        } else if asset.name == DLL {
+            "Installing the camera source"
+        } else {
+            "Installing runtime libraries"
+        };
+        progress(tx, 0.16 + (i as f32 / assets.len() as f32) * 0.42, message);
+        files
+            .write(&dir.join(asset.name), asset.bytes)
+            .map_err(|e| format!("Could not replace {}: {e}", asset.name))?;
+    }
+    // Do not replace the executable currently running from the installation dir.
+    if !same_path(&current, &setup) {
+        files.write(&setup, &fs::read(&current)?)?;
+    }
+    if let Some(previous) = &old_manifest {
+        for name in &previous.files {
+            if !names.contains(name) {
+                files.remove(&dir.join(name))?;
+            }
+        }
+        if previous.desktop_shortcuts && !desktop {
+            let old_links = shortcut_paths(true)?;
+            for (path, _) in old_links.into_iter().skip(2) {
+                files.remove(&path)?;
+            }
+        }
+    }
+    progress(tx, 0.70, "Registering the camera with Windows");
+    registry.text(COM, "", &string(&dir.join(DLL))?)?;
+    registry.text(COM, "ThreadingModel", "Both")?;
+    registry.text(APP, "DisplayName", "ASCII Cam")?;
+    registry.text(APP, "DisplayVersion", model::VERSION)?;
+    registry.text(APP, "InstallLocation", &string(dir)?)?;
+    registry.text(
+        APP,
+        "UninstallString",
+        &format!("\"{}\" --uninstall", string(&setup)?),
+    )?;
+    registry.text(
+        APP,
+        "DisplayIcon",
+        &format!("\"{}\",0", string(&dir.join(CLIENT))?),
+    )?;
+    registry.text(APP, "InstallerKind", "AsciiCamRustSetup")?;
+    registry.number(APP, "NoModify", 1)?;
+    registry.number(APP, "NoRepair", 1)?;
+    let total: u64 =
+        assets.iter().map(|a| a.bytes.len() as u64).sum::<u64>() + fs::metadata(&current)?.len();
+    registry.number(
+        APP,
+        "EstimatedSize",
+        (total / 1024).min(u32::MAX as u64) as u32,
+    )?;
+    progress(tx, 0.87, "Adding your shortcuts");
+    for (path, bytes) in link_data {
+        files.write(&path, &bytes)?;
+    }
+    let installed = InstallManifest {
+        product: "ASCII Cam".into(),
+        schema: 1,
+        version: model::VERSION.into(),
+        files: names,
+        desktop_shortcuts: desktop,
+    };
+    files.write(&dir.join(MANIFEST), &serde_json::to_vec_pretty(&installed)?)?;
+    progress(tx, 1.0, "Installation complete");
+    Ok("Client, camera host and DLL installed. Camera registration and Start menu shortcuts are ready.".into())
+}
+
+fn uninstall(
+    dir: &Path,
+    tx: &Sender<Event>,
+    files: &mut FileTransaction,
+    registry: &mut RegistryTransaction,
+) -> Result<String> {
+    progress(tx, 0.08, "Checking installed components");
     let root = RegKey::predef(HKEY_LOCAL_MACHINE);
     let app = root.open_subkey_with_flags(APP, KEY_READ | KEY_WOW64_64KEY)?;
-    let dir = directory()?;
-    let stored: String = app.get_value("InstallLocation")?;
-    if !stored.eq_ignore_ascii_case(&text(&dir)?) {
-        return Err("Unexpected installation path; refusing to delete files.".into());
+    let location: String = app.get_value("InstallLocation")?;
+    if !same_path(Path::new(&location), dir) {
+        return Err("Unexpected installation path. No files were removed.".into());
     }
     drop(app);
-    let dll = dir.join("ascii-cam.dll");
-    let setup = dir.join(SETUP);
-    let prior_dll = file_snapshot(&dll)?;
-    let prior_com = snapshot(COM)?;
-    let prior_app = snapshot(APP)?;
-    let own_com = match root.open_subkey_with_flags(COM, KEY_READ | KEY_WOW64_64KEY) {
-        Ok(key) => key
-            .get_value::<String, _>("")?
-            .eq_ignore_ascii_case(&text(&dll)?),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+    // Compatibility with the earlier DLL-only installer: it had no manifest.
+    let installed = manifest(dir)?;
+    let names = installed
+        .as_ref()
+        .map(|m| m.files.clone())
+        .unwrap_or_else(|| vec![DLL.into(), SETUP.into()]);
+    let mut owned_com = false;
+    match root.open_subkey_with_flags(COM, KEY_READ | KEY_WOW64_64KEY) {
+        Ok(key) => {
+            let path: String = key.get_value("")?;
+            owned_com = same_path(Path::new(&path), &dir.join(DLL));
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
         Err(e) => return Err(e.into()),
-    };
-    if dll.exists() {
-        fs::remove_file(&dll).map_err(|e| {
-            format!(
-                "Cannot remove DLL: {e}. Close camera applications and camera host, then retry."
+    }
+    progress(tx, 0.22, "Removing installed files");
+    for name in &names {
+        if name != SETUP {
+            files
+                .remove(&dir.join(name))
+                .map_err(|e| format!("Could not remove {name}: {e}"))?;
+        }
+    }
+    if let Some(m) = &installed {
+        for (path, _) in shortcut_paths(m.desktop_shortcuts)? {
+            files.remove(&path)?;
+        }
+    }
+    files.remove(&dir.join(MANIFEST))?;
+    progress(tx, 0.72, "Removing camera registration");
+    // Preserve a COM registration that another installation now owns.
+    if owned_com {
+        registry.change(COM, "", None)?;
+        registry.change(COM, "ThreadingModel", None)?;
+    }
+    for name in APP_VALUES {
+        registry.change(APP, name, None)?;
+    }
+    progress(tx, 1.0, "Uninstall complete");
+    Ok("Installed components, owned camera registration and shortcuts were removed. Project source files were preserved.".into())
+}
+
+fn cleanup_installer(dir: &Path) -> String {
+    let setup = dir.join(SETUP);
+    if !setup.exists() {
+        return String::new();
+    }
+    if reject_link(&setup).is_err() {
+        return " The remaining Setup file needs manual removal.".into();
+    }
+    if fs::remove_file(&setup).is_ok() {
+        return String::new();
+    }
+    // Never schedule deletion of the stable setup path: reinstalling before a
+    // reboot would otherwise cause the NEW installer to be deleted on reboot.
+    let tombstone = dir.join(format!(
+        "ascii-cam-setup.removed-{}-{}.exe",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    if fs::rename(&setup, &tombstone).is_ok() {
+        let path = wide(&tombstone);
+        if unsafe {
+            MoveFileExW(
+                PCWSTR(path.as_ptr()),
+                PCWSTR::null(),
+                MOVEFILE_DELAY_UNTIL_REBOOT,
             )
-        })?;
-    }
-    let result: Result<()> = (|| {
-        if own_com {
-            root.delete_subkey_all(CLSID)?;
         }
-        root.delete_subkey_all(APP)?;
-        Ok(())
-    })();
-    if let Err(error) = result {
-        for (path, values) in [(COM, &prior_com), (APP, &prior_app)] {
-            if let Err(e) = restore(path, values) {
-                eprintln!("Registry rollback failed: {e}");
-            }
-        }
-        if let Err(e) = restore_file(&dll, &prior_dll) {
-            eprintln!("DLL rollback failed: {e}");
-        }
-        return Err(error);
-    }
-    if setup.exists() && fs::remove_file(&setup).is_err() {
-        // Windows cannot delete an executable while it is running. Delete only
-        // this known installed file on reboot; never recursively remove a folder.
-        let path = wide(setup.as_os_str());
-        if unsafe { MoveFileExW(path.as_ptr(), std::ptr::null(), MOVEFILE_DELAY_UNTIL_REBOOT) } == 0
+        .is_ok()
         {
-            eprintln!(
-                "Remove remaining installer manually after it exits: {}",
-                setup.display()
-            );
-        } else {
-            println!("The running uninstaller will be removed after Windows restarts.");
+            return " The uninstaller file will be removed after Windows restarts.".into();
         }
+        return format!(
+            " Close this window, then delete the remaining file: {}",
+            tombstone.display()
+        );
     }
-    let _ = fs::remove_dir(&dir); // Only removes an empty directory.
-    println!("Uninstalled ASCII Cam. UI source files and projects were preserved.");
-    Ok(())
-}
-
-fn status() -> Result<()> {
-    let root = RegKey::predef(HKEY_LOCAL_MACHINE);
-    let key = root.open_subkey_with_flags(COM, KEY_READ | KEY_WOW64_64KEY)?;
-    let path: String = key.get_value("")?;
-    let threading: String = key.get_value("ThreadingModel")?;
-    println!(
-        "Registered DLL: {path}\nThreadingModel: {threading}\nFile exists: {}",
-        Path::new(&path).is_file()
-    );
-    println!(
-        "Installed-app entry exists: {}",
-        root.open_subkey_with_flags(APP, KEY_READ | KEY_WOW64_64KEY)
-            .is_ok()
-    );
-    Ok(())
-}
-
-pub fn run() -> Result<()> {
-    if !cfg!(target_arch = "x86_64") {
-        return Err("Build this installer for x86_64-pc-windows-msvc.".into());
-    }
-    let args: Vec<OsString> = std::env::args_os()
-        .skip(1)
-        .filter(|s| s != "--elevated")
-        .collect();
-    let Some(command) = args.first().and_then(|s| s.to_str()) else {
-        println!("ASCII Cam Setup\n\n  ascii-cam-setup.exe install <path-to-ascii-cam.dll>\n  ascii-cam-setup.exe status\n  ascii-cam-setup.exe uninstall\n\nInstall/uninstall request administrator permission. Close camera apps first.");
-        return Ok(());
-    };
-    if command == "status" && args.len() == 1 {
-        return status();
-    }
-    if !((command == "install" && args.len() == 2) || (command == "uninstall" && args.len() == 1)) {
-        return Err("Use install <DLL path>, status, or uninstall.".into());
-    }
-    if unsafe { IsUserAnAdmin() } == 0 {
-        if std::env::args_os().any(|arg| arg == "--elevated") {
-            return Err("Administrator access is still unavailable.".into());
-        }
-        return elevate(&args);
-    }
-    match command {
-        "install" => install(Path::new(&args[1])),
-        "uninstall" => uninstall(),
-        _ => unreachable!(),
-    }
+    " Close this window, then remove the remaining ascii-cam-setup.exe from the installation folder.".into()
 }

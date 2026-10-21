@@ -12,7 +12,39 @@ fn u32_at(data: &[u8], at: usize) -> Option<u32> {
     ))
 }
 
+pub fn validate_image(data: &[u8], dll: bool) -> Result<(), &'static str> {
+    let valid = (|| -> Option<()> {
+        if data.get(..2)? != b"MZ" {
+            return None;
+        }
+        let pe = u32_at(data, 0x3c)? as usize;
+        let header = data.get(pe..pe.checked_add(24)?)?;
+        let characteristics = u16_at(header, 22)?;
+        if &header[..4] != b"PE\0\0"
+            || u16_at(header, 4)? != 0x8664
+            || (characteristics & 0x2000 != 0) != dll
+        {
+            return None;
+        }
+        if characteristics & 0x2 == 0 {
+            return None;
+        }
+        let size = u16_at(header, 20)? as usize;
+        if size < 112 || u16_at(header, 6)? == 0 {
+            return None;
+        }
+        let start = pe.checked_add(24)?;
+        let optional = data.get(start..start.checked_add(size)?)?;
+        if u16_at(optional, 0)? != 0x20b {
+            return None;
+        }
+        Some(())
+    })();
+    valid.ok_or("The package contains an invalid or non-x64 Windows executable/DLL.")
+}
+
 pub fn validate(data: &[u8]) -> Result<(), &'static str> {
+    validate_image(data, true)?;
     validate_inner(data).ok_or("Expected a valid x64 COM DLL exporting DllGetClassObject, DllCanUnloadNow, DllRegisterServer and DllUnregisterServer. hello_append.dll is not a COM DLL.")
 }
 
@@ -104,7 +136,7 @@ mod tests {
         put16(&mut d, 132, 0x8664);
         put16(&mut d, 134, 1);
         put16(&mut d, 148, 240);
-        put16(&mut d, 150, 0x2000);
+        put16(&mut d, 150, 0x2002);
         put16(&mut d, 152, 0x20b);
         put32(&mut d, 260, 16);
         put32(&mut d, 264, 0x1000);
@@ -128,6 +160,18 @@ mod tests {
             cursor += name.len() + 1;
         }
         d
+    }
+    #[test]
+    fn rejects_wrong_binary_kind_for_clients_and_runtime_dlls() {
+        let mut d = fixture();
+        put16(&mut d, 150, 0x2002);
+        assert!(validate_image(&d, true).is_ok());
+        assert!(validate_image(&d, false).is_err());
+        put16(&mut d, 150, 2);
+        assert!(validate_image(&d, false).is_ok());
+        assert!(validate_image(&d, true).is_err());
+        put16(&mut d, 132, 0x14c);
+        assert!(validate_image(&d, false).is_err());
     }
     #[test]
     fn accepts_expected_exports() {
